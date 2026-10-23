@@ -139,6 +139,40 @@ def test_union_all_semantics_survive_rewrite():
     assert union is not None and union.args.get("distinct") is False
 
 
+def test_set_op_wrapper_has_derived_table_alias():
+    # MySQL 要求派生表必须有别名，否则 ERROR 1248
+    sql = validate_and_rewrite(
+        "SELECT id FROM orders UNION SELECT id FROM orders", "mysql", max_rows=200
+    )
+    assert "AS _Q_" in sql.upper()  # sqlglot mysql 方言生成 (...) AS _q_，不带反引号
+
+
+def test_clamp_preserves_offset():
+    sql = validate_and_rewrite("SELECT id FROM orders LIMIT 50, 99999", "mysql", max_rows=200)
+    tree = sqlglot.parse_one(sql, read="mysql")
+    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["offset"].expression.name) == 50
+
+
+def test_deeply_nested_sql_returns_gateway_error():
+    raw = "SELECT * FROM " + "(" * 300 + "SELECT 1" + ") x" * 300
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite(raw, "mysql")
+    assert exc.value.stage == "parse"
+
+
+def test_invalid_max_rows_is_rejected():
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite("SELECT 1", "mysql", max_rows=0)
+    assert exc.value.stage == "config"
+
+
+def test_unknown_dialect_is_gateway_error():
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite("SELECT 1", "not-a-real-dialect")
+    assert exc.value.stage == "parse"
+
+
 def test_output_dialect_matches_target():
     sql = validate_and_rewrite("SELECT CURRENT_TIMESTAMP AS t", "sqlite")
     # 方言往返解析不报错即视为方言正确（parse_one 是 sqlglot 顶层 API，不在 exp 模块上）
