@@ -855,8 +855,10 @@ def _jsonable(value):
     if isinstance(value, Decimal):
         try:
             number = float(value)
-        except ArithmeticError:
-            # PG numeric 的 sNaN/超大指数（MySQL DECIMAL/SQLite 不会出现）
+        except (ArithmeticError, ValueError):
+            # 超大指数 → OverflowError（ArithmeticError）；Python 3.14 起
+            # sNaN → float 直接抛内置 ValueError（不经 decimal trap；已实测 C/纯 Python 版一致）
+            # 这些值只可能来自 PG numeric（MySQL DECIMAL/SQLite 不会出现）
             return str(value)
         return number if math.isfinite(number) else None
     if isinstance(value, float):
