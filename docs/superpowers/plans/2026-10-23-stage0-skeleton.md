@@ -315,7 +315,8 @@ def test_plain_select_gets_limit_injected():
     sql = validate_and_rewrite("SELECT id FROM orders", "mysql", max_rows=200)
     tree = sqlglot.parse_one(sql, read="mysql")
     assert isinstance(tree, exp.Select)
-    assert int(tree.args["limit"].expression.name) == 200
+    # 注入 max_rows+1 哨兵，执行器据此判定截断并切回 200 行（Task 4 复审 C1）
+    assert int(tree.args["limit"].expression.name) == 201
 
 
 def test_small_existing_limit_is_kept():
@@ -325,7 +326,7 @@ def test_small_existing_limit_is_kept():
 
 def test_large_existing_limit_is_clamped():
     sql = validate_and_rewrite("SELECT id FROM orders LIMIT 99999", "mysql", max_rows=200)
-    assert int(sqlglot.parse_one(sql, read="mysql").args["limit"].expression.name) == 200
+    assert int(sqlglot.parse_one(sql, read="mysql").args["limit"].expression.name) == 201
 
 
 def test_cte_select_is_allowed_and_limited():
@@ -374,7 +375,7 @@ def test_select_into_is_rejected():
 
 def test_trailing_semicolon_is_tolerated():
     sql = validate_and_rewrite("SELECT id FROM orders;", "mysql", max_rows=200)
-    assert "LIMIT 200" in sql.upper()
+    assert "LIMIT 201" in sql.upper()
 
 
 def test_empty_sql_is_rejected():
@@ -389,7 +390,7 @@ def test_nul_byte_is_rejected():
 
 def test_trailing_comment_after_semicolon_is_tolerated():
     sql = validate_and_rewrite("SELECT id FROM orders; -- note\n", "mysql", max_rows=200)
-    assert "LIMIT 200" in sql.upper()
+    assert "LIMIT 201" in sql.upper()
 
 
 def test_unterminated_string_returns_gateway_error():
@@ -407,7 +408,7 @@ def test_unterminated_string_returns_gateway_error():
 def test_non_literal_or_negative_limits_are_clamped(raw, dialect):
     sql = validate_and_rewrite(raw, dialect, max_rows=200)
     tree = sqlglot.parse_one(sql, read=dialect)
-    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["limit"].expression.name) == 201
 
 
 def test_into_hidden_in_union_branch_is_rejected():
@@ -453,7 +454,7 @@ def test_set_op_wrapper_has_derived_table_alias():
 def test_clamp_preserves_offset():
     sql = validate_and_rewrite("SELECT id FROM orders LIMIT 50, 99999", "mysql", max_rows=200)
     tree = sqlglot.parse_one(sql, read="mysql")
-    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["limit"].expression.name) == 201
     assert int(tree.args["offset"].expression.name) == 50
 
 
@@ -574,9 +575,13 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
 
 
 def _apply_row_limit(select: exp.Select, max_rows: int) -> exp.Select:
+    # 哨兵约定（Task 4 对抗式复审 C1）：无用户 LIMIT 或需要收敛时，注入
+    # LIMIT max_rows+1 而不是 max_rows——执行器 fetchmany(max_rows+1) 靠多取的
+    # 第 max_rows+1 行判定 truncated 并在应用层切回 max_rows 行。用户显式给出的
+    # 受信任字面量 LIMIT n（0<=n<=max_rows）原样保留（此时 truncated 必为 False）。
     current = select.args.get("limit")
     if current is None:
-        return select.limit(max_rows)
+        return select.limit(max_rows + 1)
 
     expr = current.expression
     # 只信任无符号整数字面量。负数（SQLite/PG 中 LIMIT -1 等于不限制）、
@@ -585,11 +590,11 @@ def _apply_row_limit(select: exp.Select, max_rows: int) -> exp.Select:
         try:
             requested = int(expr.name)
         except ValueError:
-            return select.limit(max_rows)
+            return select.limit(max_rows + 1)
         if 0 <= requested <= max_rows:
             return select
 
-    return select.limit(max_rows)
+    return select.limit(max_rows + 1)
 ```
 
 - [ ] **Step 4: 运行确认全部通过**
@@ -602,7 +607,7 @@ Expected: 全部通过（含 UNION/CTE/LIMIT/拒绝写操作共 12+ 用例）。
 
 > 阶段 0 已知限制（对抗式复审结论，记入 backlog 不影响出口）：
 > - TSQL `TOP n PERCENT` 往返会损坏（sqlglot 解析保真问题，输出不可执行→fail-closed）
-> - 小行数的 `FETCH FIRST n ROWS ONLY` 会被保守收敛到 200（安全方向）
+> - 小行数的 `FETCH FIRST n ROWS ONLY` 会被保守收敛到哨兵值 max_rows+1（默认 201，安全方向；执行器切回 200 行并置 truncated）
 > - ClickHouse `LIMIT ... BY` 收敛时丢失 BY 子句
 > - 超长 IN 列表/深层嵌套有解析 CPU 成本（深层嵌套已结构化拒绝；输入大小上限留到阶段 1）
 > - 表级锁提示（WITH (TABLOCKX)）不经 exp.Lock 节点，拦不住；依赖只读账号兜底
@@ -627,12 +632,21 @@ git commit -m "feat(stage0): SQL 只读校验、单语句限制与 LIMIT 强制�
 `tests/test_executor.py`：
 
 ```python
+import sqlite3
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+import sqlglot
 from sqlalchemy import create_engine, text
 
-from app.executor import run_query
+from app.errors import GatewayError
+from app.executor import _jsonable, run_query
+from app.validator import validate_and_rewrite
 
 
-def _engine_with_orders(tmp_path):
+@pytest.fixture
+def orders_engine(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 't.db'}")
     with engine.begin() as conn:
         conn.execute(text(
@@ -642,41 +656,132 @@ def _engine_with_orders(tmp_path):
             "INSERT INTO orders (id, channel, amt) VALUES "
             "(1, 'web', 10.0), (2, 'app', 20.0), (3, 'app', 30.0)"
         ))
-    return engine
+    yield engine
+    engine.dispose()  # Windows 下不 dispose 会让 tmp_path 回收偶发失败（复审 M6）
 
 
-def test_run_query_returns_columns_and_rows(tmp_path):
-    result = run_query(_engine_with_orders(tmp_path),
-                       "SELECT channel, SUM(amt) AS total FROM orders GROUP BY channel ORDER BY channel",
-                       max_rows=200)
+def _add_rows(engine, n, start=4):
+    with engine.begin() as conn:
+        for i in range(start, start + n):
+            conn.execute(text(f"INSERT INTO orders (id, channel, amt) VALUES ({i}, 'x', 1.0)"))
+
+
+def test_run_query_returns_columns_and_rows(orders_engine):
+    result = run_query(
+        orders_engine,
+        "SELECT channel, SUM(amt) AS total FROM orders GROUP BY channel ORDER BY channel",
+        max_rows=200,
+    )
     assert result["ok"] is True
     assert result["columns"] == ["channel", "total"]
     assert result["rows"] == [["app", 50.0], ["web", 10.0]]
     assert result["truncated"] is False
 
 
-def test_run_query_marks_truncation(tmp_path):
-    engine = _engine_with_orders(tmp_path)
-    with engine.begin() as conn:
-        for i in range(4, 8):
-            conn.execute(text(f"INSERT INTO orders (id, channel, amt) VALUES ({i}, 'x', 1.0)"))
-
-    result = run_query(engine, "SELECT id FROM orders ORDER BY id", max_rows=5)
+def test_run_query_marks_truncation(orders_engine):
+    _add_rows(orders_engine, 4)  # 共 7 行；直接喂执行器（无 LIMIT）验证 +1 哨兵机制本身
+    result = run_query(orders_engine, "SELECT id FROM orders ORDER BY id", max_rows=5)
     assert len(result["rows"]) == 5
     assert result["truncated"] is True
 
 
-def test_run_query_returns_json_native_types(tmp_path):
-    # SQLite 原样返回文本；MySQL 下 Decimal/datetime 由 _jsonable 兜底，此处直接验证转换函数
-    import datetime
-    from decimal import Decimal
+def test_truncation_exact_boundary_is_false(orders_engine):
+    _add_rows(orders_engine, 4)  # 共 7 行，恰好取 7 行不算截断
+    result = run_query(orders_engine, "SELECT id FROM orders ORDER BY id", max_rows=7)
+    assert len(result["rows"]) == 7
+    assert result["truncated"] is False
 
-    from app.executor import _jsonable
 
+def test_validator_then_executor_detects_truncation(orders_engine):
+    # 复审 C1 回归：真实链路下 validator 注入 max_rows+1，截断标志必须可用
+    _add_rows(orders_engine, 4)  # 共 7 行
+    safe_sql = validate_and_rewrite("SELECT id FROM orders ORDER BY id", "sqlite", max_rows=5)
+    assert int(sqlglot.parse_one(safe_sql, read="sqlite").args["limit"].expression.name) == 6
+    result = run_query(orders_engine, safe_sql, max_rows=5)
+    assert len(result["rows"]) == 5
+    assert result["truncated"] is True
+
+
+def test_validator_then_executor_exact_boundary(orders_engine):
+    _add_rows(orders_engine, 4)  # 共 7 行，哨兵 LIMIT 8 只取回 7 行 → 不截断
+    safe_sql = validate_and_rewrite("SELECT id FROM orders ORDER BY id", "sqlite", max_rows=7)
+    result = run_query(orders_engine, safe_sql, max_rows=7)
+    assert len(result["rows"]) == 7
+    assert result["truncated"] is False
+
+
+def test_bad_column_raises_gateway_error(orders_engine):
+    with pytest.raises(GatewayError) as exc:
+        run_query(orders_engine, "SELECT nope FROM orders")
+    assert exc.value.stage == "execute"
+
+
+class _ExplodingCursor:
+    """模拟非 DBAPI 异常（PyMySQL 在 execute() 内解码字符集会抛 UnicodeDecodeError）。"""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, *args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte in legacy GBK table")
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _ExplodingConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _ExplodingCursor(self._conn.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_non_dbapi_error_is_structured_not_leaked():
+    # 复审 C2 回归：非 DBAPI 异常不经 SQLAlchemy 包装，也必须结构化为 GatewayError
+    engine = create_engine(
+        "sqlite://",
+        creator=lambda: _ExplodingConnection(sqlite3.connect(":memory:")),
+    )
+    try:
+        with pytest.raises(GatewayError) as exc:
+            run_query(engine, "SELECT 1")
+        assert exc.value.stage == "execute"
+        assert "UnicodeDecodeError" in exc.value.reason
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("bad_max_rows", [0, -1])
+def test_invalid_max_rows_raises_config_error(orders_engine, bad_max_rows):
+    with pytest.raises(GatewayError) as exc:
+        run_query(orders_engine, "SELECT 1", max_rows=bad_max_rows)
+    assert exc.value.stage == "config"
+
+
+def test_jsonable_conversions():
+    # SQLite 原样返回文本；MySQL 下 Decimal/datetime 由 _jsonable 兜底
     assert _jsonable(Decimal("1.5")) == 1.5
-    assert _jsonable(datetime.date(2026, 10, 22)) == "2026-10-22"
-    assert _jsonable(datetime.datetime(2026, 10, 22, 9, 30)) == "2026-10-22T09:30:00"
-    assert isinstance(_jsonable(None), type(None))
+    assert _jsonable(date(2026, 10, 22)) == "2026-10-22"
+    assert _jsonable(datetime(2026, 10, 22, 9, 30)) == "2026-10-22T09:30:00"
+    assert _jsonable(None) is None
+    # MySQL TIME 经 PyMySQL 转 timedelta（可负、可超 24 小时、可带小数秒）（复审 I1）
+    assert _jsonable(timedelta(hours=9, minutes=30)) == "09:30:00"
+    assert _jsonable(timedelta(hours=-30)) == "-30:00:00"
+    assert _jsonable(timedelta(hours=1, minutes=2, seconds=3, microseconds=456000)) == "01:02:03.456000"
+    # 非有限浮点数不得产出 Infinity/NaN 非法 JSON token；Decimal NaN/超大指数同样收敛（复审 I2/I3）
+    assert _jsonable(float("inf")) is None
+    assert _jsonable(float("nan")) is None
+    assert _jsonable(Decimal("NaN")) is None
+    assert _jsonable(Decimal("sNaN")) == "sNaN"
+    # 超 JS 安全整数范围的 BIGINT（如雪花 ID）转字符串保精度（复审 I3）
+    assert _jsonable(2**63) == str(2**63)
+    assert _jsonable(42) == 42
+    assert _jsonable(True) is True
+    assert _jsonable(b"\x01") == "01"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -693,6 +798,7 @@ Expected: FAIL，`No module named 'app.executor'`
 
 ```python
 import datetime
+import math
 from decimal import Decimal
 
 from sqlalchemy import text
@@ -701,24 +807,44 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.errors import GatewayError
 
+# 超过 JS 安全整数范围的 BIGINT（如雪花 ID）序列化为字符串，避免前端/Agent 丢精度
+_JS_MAX_SAFE_INTEGER = 9007199254740991
+
 
 def run_query(engine: Engine, sql: str, max_rows: int = 200) -> dict:
-    """执行已通过校验的查询。多取 1 行用于判断截断；结果做 JSON 安全序列化。"""
+    """执行已通过校验的查询，返回 {ok, columns, rows, truncated}。
+
+    哨兵约定：validator 对无限制查询注入 LIMIT max_rows+1，这里 fetchmany
+    多取 1 行判定截断、实际只返回 max_rows 行。
+
+    本函数绝不向调用方抛裸异常（Gateway"永不抛异常"契约）：SQLAlchemyError
+    给可自纠建议；非 DBAPI 异常（如 PyMySQL 全缓冲游标在 execute() 内做字符集
+    解码抛的 UnicodeDecodeError）不会被 SQLAlchemy 包装，由 except Exception
+    兜底；结果行转换同样在守卫区内。
+    """
+    if max_rows < 1:
+        raise GatewayError("config", "max_rows 必须为正整数", "联系管理员检查 MAX_ROWS 配置")
     try:
         with engine.connect() as connection:
             result = connection.execute(text(sql))
             columns = list(result.keys())
-            rows = result.fetchmany(max_rows + 1)
+            raw_rows = result.fetchmany(max_rows + 1)
+        truncated = len(raw_rows) > max_rows
+        rows = [_jsonable_row(row) for row in raw_rows[:max_rows]]
     except SQLAlchemyError as exc:
         raise GatewayError(
             "execute",
             f"数据库执行失败：{str(exc)[:300]}",
             "检查表名、字段名与方言语法，修正后重试",
         )
+    except Exception as exc:  # noqa: BLE001 - 网关契约：任何异常都结构化，不向 MCP 层裸抛
+        raise GatewayError(
+            "execute",
+            f"数据库执行失败：{type(exc).__name__}: {str(exc)[:200]}",
+            "稍后重试；若持续失败请联系管理员检查数据库连接与字符集",
+        )
 
-    truncated = len(rows) > max_rows
-    data = [_jsonable_row(row) for row in rows[:max_rows]]
-    return {"ok": True, "columns": columns, "rows": data, "truncated": truncated}
+    return {"ok": True, "columns": columns, "rows": rows, "truncated": truncated}
 
 
 def _jsonable_row(row) -> list:
@@ -727,12 +853,35 @@ def _jsonable_row(row) -> list:
 
 def _jsonable(value):
     if isinstance(value, Decimal):
-        return float(value)
+        try:
+            number = float(value)
+        except ArithmeticError:
+            # PG numeric 的 sNaN/超大指数（MySQL DECIMAL/SQLite 不会出现）
+            return str(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, float):
+        # SQLite 1e999 → inf：json.dumps 默认输出 Infinity 非法 token，严格解析器会拒收
+        return value if math.isfinite(value) else None
+    if isinstance(value, datetime.timedelta):
+        # MySQL TIME 经 PyMySQL 转 timedelta（可负、可超 24 小时），按 MySQL 风格 HH:MM:SS
+        return _timedelta_to_mysql_time(value)
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
     if isinstance(value, (bytes, bytearray)):
         return value.hex()
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > _JS_MAX_SAFE_INTEGER:
+        return str(value)
     return value
+
+
+def _timedelta_to_mysql_time(value: datetime.timedelta) -> str:
+    abs_value = abs(value)
+    total_seconds = int(abs_value.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    sign = "-" if value.total_seconds() < 0 else ""
+    fraction = f".{abs_value.microseconds:06d}" if abs_value.microseconds else ""
+    return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}{fraction}"
 ```
 
 - [ ] **Step 4: 运行确认通过**
@@ -741,7 +890,7 @@ def _jsonable(value):
 pytest tests/test_executor.py
 ```
 
-Expected: `3 passed`
+Expected: `10 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -749,6 +898,13 @@ Expected: `3 passed`
 git add services/query-gateway/app/executor.py services/query-gateway/tests/test_executor.py
 git commit -m "feat(stage0): SQLAlchemy 查询执行器（截断标记、JSON 安全序列化）"
 ```
+
+> **Task 4 对抗式复审裁定（2026-10-23 回写）**：
+> - **C1（修复，跨 Task 3）**：validator 注入/收敛 LIMIT 改为 `max_rows+1` 哨兵；执行器 fetchmany(max_rows+1) + 切片 max_rows，truncated 才在真实链路上可达。用户显式 LIMIT n≤max_rows 原样保留。
+> - **C2（修复）**：非 DBAPI 异常（实证：PyMySQL 全缓冲游标在 execute() 内解码遗留 GBK/latin1 字符集会抛 UnicodeDecodeError，SQLAlchemy 不包装）由 `except Exception` 兜底；行转换纳入同一守卫区。
+> - **I1/I2/I3（修复）**：timedelta→MySQL 风格 HH:MM:SS（含负值/超 24 小时/小数秒）；Decimal 特殊值（NaN→None、sNaN/溢出→字符串）；非有限 float→None；超 2^53 整数转字符串保精度（雪花 ID 场景）。
+> - **M2/I4/M6（修复）**：run_query 入口 max_rows<1 → stage="config"；补齐执行器异常路径、精确边界、validator→executor 组合测试；测试 fixture 负责 engine.dispose()。
+> - **接受为 backlog（阶段 0 不修）**：M1 MySQL 全缓冲游标使 LIMIT 前传输不受限（哨兵 LIMIT 已在服务端收敛输出，后续考虑 SSCursor/stream_results）；M3 PEP 249 fetchmany 短读（sqlite/PyMySQL 均可靠，哨兵 LIMIT 双保险；ClickHouse/PG 服务端游标接入时再验）；M4 连接/鉴权错误与 SQL 错误共用 stage="execute"（阶段 1 细分）；M5 返回类型 TypedDict；M7 `SELECT GET_LOCK(...)` 命名锁（只读账号/连接回收策略阶段 1 处理）；PG 数组/jsonb 的递归 _jsonable 转换。
 
 ---
 
@@ -1124,7 +1280,7 @@ def get_table_meta(table_name: str) -> dict:
 
 @mcp.tool()
 def run_readonly_sql(sql: str) -> dict:
-    """在数仓上执行只读 SELECT 查询（自动强制 LIMIT 200）。
+    """在数仓上执行只读 SELECT 查询（自动注入 LIMIT 201 哨兵，最多返回 200 行）。
     成功返回 {ok, columns, rows, truncated, executed_sql}；
     失败返回 {ok:false, stage, reason, suggestion}，应按 suggestion 修正后重试。"""
     return _gateway.run_readonly_sql(sql, user="dbgpt")
@@ -1282,7 +1438,7 @@ def test_safe_subqueries_are_allowed():
     # 子查询、IN、EXISTS 等正常只读写法不得误伤
     safe = "SELECT * FROM orders WHERE id IN (SELECT order_id FROM pay WHERE dt = '2026-10-22')"
     out = validate_and_rewrite(safe, "mysql", max_rows=200)
-    assert "LIMIT 200" in out.upper()
+    assert "LIMIT 201" in out.upper()
 ```
 
 > 注：`SELECT ... INTO OUTFILE` 在 sqlglot 中体现为 Select 的 into 参数，Task 3 已拒绝；若该用例在你的 sqlglot 版本上被解析成别的结构而失败，按实际报错把断言收窄为「抛 GatewayError」（不指定 stage），并在提交信息里记录 sqlglot 版本。
@@ -1760,7 +1916,7 @@ git merge --no-ff feat/stage0-skeleton -m "merge: 阶段 0 骨架验证完成"
 - [ ] 三个 MCP 工具经网关工作，网关是唯一数据库出口
 - [ ] 三道验收题结果正确（500/100、3 笔、表清单）
 - [ ] 破坏性 SQL 100% 被 parse 阶段拒绝，恶意用例库全绿
-- [ ] LIMIT 200 强制生效，审计 JSONL 完整
+- [ ] 无限制查询注入 LIMIT 201 哨兵、返回最多 200 行且超量时 truncated=true，审计 JSONL 完整
 - [ ] 50 个真实问数原话已启动收集（至少到位 20 条）
 - [ ] 干净环境 `down -v` 重建可复现
 ```
