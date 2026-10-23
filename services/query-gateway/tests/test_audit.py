@@ -15,3 +15,17 @@ def test_append_audit_writes_jsonl_with_timestamp(tmp_path):
     assert records[0]["user"] == "u1"
     assert "ts" in records[0]
     assert records[1]["rows"] == 2
+
+
+def test_append_audit_creates_missing_parent_dirs(tmp_path):
+    log_file = tmp_path / "nested" / "deep" / "audit.jsonl"
+    append_audit(str(log_file), {"event": "x"})
+    assert log_file.exists()
+
+
+def test_caller_cannot_override_timestamp(tmp_path):
+    log_file = tmp_path / "audit.jsonl"
+    append_audit(str(log_file), {"event": "x", "ts": "FAKE"})
+    record = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert record["ts"] != "FAKE"
+    assert record["event"] == "x"
