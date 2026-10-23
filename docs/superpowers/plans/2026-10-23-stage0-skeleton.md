@@ -472,9 +472,10 @@ _READ_ONLY_ROOT = (exp.Select, exp.Union, exp.Intersect, exp.Except)
 
 # 纯只读查询的 AST 中任何位置都不允许出现这些节点：
 # 可拦住数据修改型 CTE、藏在 UNION 分支/子查询里的 INTO、SELECT ... FOR UPDATE 等绕过
+# 注：sqlglot 中 ALTER 的节点名是 exp.Alter（AlterColumn/AlterRename 等的基类，不存在 exp.AlterTable）
 _FORBIDDEN_NODES = (
     exp.Insert, exp.Update, exp.Delete, exp.Merge,
-    exp.Create, exp.Drop, exp.AlterTable, exp.TruncateTable,
+    exp.Create, exp.Drop, exp.Alter, exp.TruncateTable,
     exp.Into, exp.Lock,
 )
 
