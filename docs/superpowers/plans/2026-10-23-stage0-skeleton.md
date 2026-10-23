@@ -83,11 +83,14 @@ Expected: `Switched to a new branch 'feat/stage0-skeleton'`
 
 ```text
 mcp==1.2.0
+pydantic>=2.10.1,<2.14
 sqlglot>=24,<27
 SQLAlchemy>=2.0,<2.1
 PyMySQL==1.1.1
 pytest==8.3.4
 ```
+
+> 注：mcp 1.2.0 import 了 pydantic 2.14 中被删除的私有符号 `pydantic._internal._typing_extra.eval_type_backport`，故必须上顶 `<2.14`。
 
 `services/query-gateway/pytest.ini`：
 
@@ -180,6 +183,20 @@ def test_append_audit_writes_jsonl_with_timestamp(tmp_path):
     assert records[0]["user"] == "u1"
     assert "ts" in records[0]
     assert records[1]["rows"] == 2
+
+
+def test_append_audit_creates_missing_parent_dirs(tmp_path):
+    log_file = tmp_path / "nested" / "deep" / "audit.jsonl"
+    append_audit(str(log_file), {"event": "x"})
+    assert log_file.exists()
+
+
+def test_caller_cannot_override_timestamp(tmp_path):
+    log_file = tmp_path / "audit.jsonl"
+    append_audit(str(log_file), {"event": "x", "ts": "FAKE"})
+    record = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert record["ts"] != "FAKE"
+    assert record["event"] == "x"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -246,10 +263,11 @@ from pathlib import Path
 
 
 def append_audit(path: str, record: dict) -> None:
-    """向 JSONL 审计文件追加一条记录，自动补 ts。只追加，不修改历史。"""
+    """向 JSONL 审计文件追加一条记录，自动补 ts（调用方无法伪造/覆盖时间戳）。只追加。"""
     log_path = Path(path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **record}
+    # ts 必须最后合并：服务端时钟永远优先于 record 中的同名字段
+    payload = {**record, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 ```
