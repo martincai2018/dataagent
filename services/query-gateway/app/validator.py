@@ -54,7 +54,8 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
                 "改写为 SELECT/WITH 查询，禁止任何 DDL 或增删改操作",
             )
 
-        # 整树扫描写节点（必须在集合操作包装之前做，否则只能看到外层包装）
+        # 整树扫描写节点：在集合操作包装之前做，保证拒绝发生在任何重写/包装之前
+        # （深度防御，且错误信息指向原始语句；find 本身会递归进子查询，包装后同样能命中）
         forbidden = statement.find(*_FORBIDDEN_NODES)
         if forbidden is not None:
             raise GatewayError(

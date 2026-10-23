@@ -139,12 +139,15 @@ def test_union_all_semantics_survive_rewrite():
     assert union is not None and union.args.get("distinct") is False
 
 
-def test_set_op_wrapper_has_derived_table_alias():
-    # MySQL 要求派生表必须有别名，否则 ERROR 1248
-    sql = validate_and_rewrite(
-        "SELECT id FROM orders UNION SELECT id FROM orders", "mysql", max_rows=200
-    )
-    assert "AS _Q_" in sql.upper()  # sqlglot mysql 方言生成 (...) AS _q_，不带反引号
+@pytest.mark.parametrize("raw,dialect", [
+    ("SELECT id FROM orders UNION SELECT id FROM orders", "mysql"),
+    ("SELECT 1 INTERSECT SELECT 2", "mysql"),
+    ("SELECT 1 EXCEPT SELECT 2", "sqlite"),
+])
+def test_set_op_wrapper_has_derived_table_alias(raw, dialect):
+    # MySQL 要求派生表必须有别名，否则 ERROR 1248；三种集合操作都要回归
+    sql = validate_and_rewrite(raw, dialect, max_rows=200)
+    assert ") AS _Q_" in sql.upper()  # sqlglot 生成 (...) AS _q_，不带反引号
 
 
 def test_clamp_preserves_offset():
@@ -159,11 +162,22 @@ def test_deeply_nested_sql_returns_gateway_error():
     with pytest.raises(GatewayError) as exc:
         validate_and_rewrite(raw, "mysql")
     assert exc.value.stage == "parse"
+    # 钉住真实触发路径：该深度在序列化（generator 递归）阶段触顶
+    assert "RecursionError" in exc.value.reason
 
 
-def test_invalid_max_rows_is_rejected():
+@pytest.mark.parametrize("bad_sql", [None, 123])
+def test_non_string_input_is_rejected(bad_sql):
     with pytest.raises(GatewayError) as exc:
-        validate_and_rewrite("SELECT 1", "mysql", max_rows=0)
+        validate_and_rewrite(bad_sql, "mysql")
+    assert exc.value.stage == "parse"
+    assert "为空或含非法字符" in exc.value.reason
+
+
+@pytest.mark.parametrize("bad_max_rows", [0, -1])
+def test_invalid_max_rows_is_rejected(bad_max_rows):
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite("SELECT 1", "mysql", max_rows=bad_max_rows)
     assert exc.value.stage == "config"
 
 
