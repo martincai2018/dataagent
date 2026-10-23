@@ -12,7 +12,7 @@ def test_plain_select_gets_limit_injected():
     sql = validate_and_rewrite("SELECT id FROM orders", "mysql", max_rows=200)
     tree = sqlglot.parse_one(sql, read="mysql")
     assert isinstance(tree, exp.Select)
-    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["limit"].expression.name) == 201
 
 
 def test_small_existing_limit_is_kept():
@@ -22,7 +22,7 @@ def test_small_existing_limit_is_kept():
 
 def test_large_existing_limit_is_clamped():
     sql = validate_and_rewrite("SELECT id FROM orders LIMIT 99999", "mysql", max_rows=200)
-    assert int(sqlglot.parse_one(sql, read="mysql").args["limit"].expression.name) == 200
+    assert int(sqlglot.parse_one(sql, read="mysql").args["limit"].expression.name) == 201
 
 
 def test_cte_select_is_allowed_and_limited():
@@ -71,7 +71,7 @@ def test_select_into_is_rejected():
 
 def test_trailing_semicolon_is_tolerated():
     sql = validate_and_rewrite("SELECT id FROM orders;", "mysql", max_rows=200)
-    assert "LIMIT 200" in sql.upper()
+    assert "LIMIT 201" in sql.upper()
 
 
 def test_empty_sql_is_rejected():
@@ -86,7 +86,7 @@ def test_nul_byte_is_rejected():
 
 def test_trailing_comment_after_semicolon_is_tolerated():
     sql = validate_and_rewrite("SELECT id FROM orders; -- note\n", "mysql", max_rows=200)
-    assert "LIMIT 200" in sql.upper()
+    assert "LIMIT 201" in sql.upper()
 
 
 def test_unterminated_string_returns_gateway_error():
@@ -104,7 +104,7 @@ def test_unterminated_string_returns_gateway_error():
 def test_non_literal_or_negative_limits_are_clamped(raw, dialect):
     sql = validate_and_rewrite(raw, dialect, max_rows=200)
     tree = sqlglot.parse_one(sql, read=dialect)
-    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["limit"].expression.name) == 201
 
 
 def test_into_hidden_in_union_branch_is_rejected():
@@ -153,7 +153,7 @@ def test_set_op_wrapper_has_derived_table_alias(raw, dialect):
 def test_clamp_preserves_offset():
     sql = validate_and_rewrite("SELECT id FROM orders LIMIT 50, 99999", "mysql", max_rows=200)
     tree = sqlglot.parse_one(sql, read="mysql")
-    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["limit"].expression.name) == 201
     assert int(tree.args["offset"].expression.name) == 50
 
 

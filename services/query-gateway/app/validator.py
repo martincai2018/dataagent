@@ -78,9 +78,12 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
 
 
 def _apply_row_limit(select: exp.Select, max_rows: int) -> exp.Select:
+    # 哨兵约定（Task 4 对抗式复审 C1）：无用户 LIMIT 或需要收敛时注入
+    # LIMIT max_rows+1——执行器 fetchmany(max_rows+1) 靠多取的第 max_rows+1 行
+    # 判定 truncated，并在应用层切回 max_rows 行。用户显式 LIMIT n<=max_rows 原样保留。
     current = select.args.get("limit")
     if current is None:
-        return select.limit(max_rows)
+        return select.limit(max_rows + 1)
 
     expr = current.expression
     # 只信任无符号整数字面量。负数（SQLite/PG 中 LIMIT -1 等于不限制）、
@@ -89,8 +92,8 @@ def _apply_row_limit(select: exp.Select, max_rows: int) -> exp.Select:
         try:
             requested = int(expr.name)
         except ValueError:
-            return select.limit(max_rows)
+            return select.limit(max_rows + 1)
         if 0 <= requested <= max_rows:
             return select
 
-    return select.limit(max_rows)
+    return select.limit(max_rows + 1)
