@@ -3,12 +3,7 @@ from sqlglot import exp
 
 from app.errors import GatewayError
 
-# 兼容：sqlglot 26.33 将 parse_one 收为顶层 API，expressions 模块不再转出该名字，
-# 既有调用方仍使用 exp.parse_one。这里补回指向同一函数的模块级别名。
-if not hasattr(exp, "parse_one"):
-    exp.parse_one = sqlglot.parse_one
-
-# sqlglot 26.x 起 UNION ALL 不再有独立节点，统一为 exp.Union(distinct=False)
+# UNION ALL 在 sqlglot 中没有独立节点，统一为 exp.Union(distinct=False)
 _READ_ONLY_ROOT = (exp.Select, exp.Union, exp.Intersect, exp.Except)
 
 
