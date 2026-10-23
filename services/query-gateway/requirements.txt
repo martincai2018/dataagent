@@ -1,0 +1,5 @@
+mcp==1.2.0
+sqlglot>=24,<27
+SQLAlchemy>=2.0,<2.1
+PyMySQL==1.1.1
+pytest==8.3.4
