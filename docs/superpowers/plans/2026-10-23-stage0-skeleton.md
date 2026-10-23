@@ -442,6 +442,40 @@ def test_union_all_semantics_survive_rewrite():
     assert union is not None and union.args.get("distinct") is False
 
 
+def test_set_op_wrapper_has_derived_table_alias():
+    # MySQL 要求派生表必须有别名，否则 ERROR 1248
+    sql = validate_and_rewrite(
+        "SELECT id FROM orders UNION SELECT id FROM orders", "mysql", max_rows=200
+    )
+    assert "AS _Q_" in sql.upper()  # sqlglot mysql 方言生成 (...) AS _q_，不带反引号
+
+
+def test_clamp_preserves_offset():
+    sql = validate_and_rewrite("SELECT id FROM orders LIMIT 50, 99999", "mysql", max_rows=200)
+    tree = sqlglot.parse_one(sql, read="mysql")
+    assert int(tree.args["limit"].expression.name) == 200
+    assert int(tree.args["offset"].expression.name) == 50
+
+
+def test_deeply_nested_sql_returns_gateway_error():
+    raw = "SELECT * FROM " + "(" * 300 + "SELECT 1" + ") x" * 300
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite(raw, "mysql")
+    assert exc.value.stage == "parse"
+
+
+def test_invalid_max_rows_is_rejected():
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite("SELECT 1", "mysql", max_rows=0)
+    assert exc.value.stage == "config"
+
+
+def test_unknown_dialect_is_gateway_error():
+    with pytest.raises(GatewayError) as exc:
+        validate_and_rewrite("SELECT 1", "not-a-real-dialect")
+    assert exc.value.stage == "parse"
+
+
 def test_output_dialect_matches_target():
     sql = validate_and_rewrite("SELECT CURRENT_TIMESTAMP AS t", "sqlite")
     # 方言往返解析不报错即视为方言正确（parse_one 是 sqlglot 顶层 API，不在 exp 模块上）
@@ -485,13 +519,16 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
 
     任何违规都抛 GatewayError(stage="parse")，suggestion 供 Agent 自纠。
     """
-    if not sql or not sql.strip() or "\x00" in sql:
+    if not isinstance(sql, str) or not sql.strip() or "\x00" in sql:
         raise GatewayError("parse", "SQL 为空或含非法字符", "提交一条 SELECT 查询")
+    if max_rows < 1:
+        raise GatewayError("config", "max_rows 必须为正整数", "联系管理员检查 MAX_ROWS 配置")
 
     try:
         parsed = sqlglot.parse(sql.strip(), read=dialect)
-    except SqlglotError as exc:  # ParseError / TokenError（如未闭合引号）都要结构化
-        raise GatewayError("parse", f"SQL 解析失败：{exc}", "检查 SQL 语法后重试")
+    except (SqlglotError, RecursionError, ValueError) as exc:
+        # ParseError / TokenError（未闭合引号）/ 超深嵌套 RecursionError / 未知方言 ValueError
+        raise GatewayError("parse", f"SQL 解析失败：{type(exc).__name__}", "检查 SQL 语法后重试")
 
     # 容忍 "SELECT 1;" 这类尾随空语句（None / 孤立 Semicolon 节点），拒绝第二条真实语句
     statements = [
@@ -524,9 +561,10 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
             "只允许纯 SELECT 查询，不要落表、修改数据或加锁",
         )
 
-    # UNION/INTERSECT 等集合操作包一层子查询，统一在外层挂 LIMIT
+    # UNION/INTERSECT 等集合操作包一层子查询，统一在外层挂 LIMIT。
+    # 派生表必须带别名：MySQL 要求 "Every derived table must have its own alias"
     if not isinstance(statement, exp.Select):
-        statement = exp.select("*").from_(statement.subquery())
+        statement = exp.select("*").from_(statement.subquery(alias="_q_"))
 
     statement = _apply_row_limit(statement, max_rows)
     return statement.sql(dialect=dialect)
@@ -558,6 +596,13 @@ pytest tests/test_validator.py
 ```
 
 Expected: 全部通过（含 UNION/CTE/LIMIT/拒绝写操作共 12+ 用例）。
+
+> 阶段 0 已知限制（对抗式复审结论，记入 backlog 不影响出口）：
+> - TSQL `TOP n PERCENT` 往返会损坏（sqlglot 解析保真问题，输出不可执行→fail-closed）
+> - 小行数的 `FETCH FIRST n ROWS ONLY` 会被保守收敛到 200（安全方向）
+> - ClickHouse `LIMIT ... BY` 收敛时丢失 BY 子句
+> - 超长 IN 列表/深层嵌套有解析 CPU 成本（深层嵌套已结构化拒绝；输入大小上限留到阶段 1）
+> - 表级锁提示（WITH (TABLOCKX)）不经 exp.Lock 节点，拦不住；依赖只读账号兜底
 
 - [ ] **Step 5: 提交**
 
