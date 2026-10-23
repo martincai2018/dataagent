@@ -84,7 +84,8 @@ Expected: `Switched to a new branch 'feat/stage0-skeleton'`
 ```text
 mcp==1.2.0
 pydantic>=2.10.1,<2.14
-sqlglot>=24,<27
+# sqlglot 26 合并了 Union/UnionAll、收走了 exp.parse_one；计划代码按 25.x API 编写，故上顶 <26
+sqlglot>=25,<26
 SQLAlchemy>=2.0,<2.1
 PyMySQL==1.1.1
 pytest==8.3.4
