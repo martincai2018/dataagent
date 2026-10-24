@@ -1905,6 +1905,11 @@ MALICIOUS = [
     "CREATE VIEW v AS SELECT 1",
     # 落表类
     "SELECT * INTO OUTFILE '/tmp/x.csv' FROM t",
+    # 单语句 Command 根（Task 8 对抗复审加厚）：sqlglot 把 GRANT/CALL/USE 等解析为
+    # exp.Command 家族，根白名单拒绝；此前整库仅 RENAME 一条单品钉住该家族
+    "GRANT SELECT ON *.* TO x",
+    "CALL some_proc(1)",
+    "USE demo",
     # 空白/异常
     "",
     ";;;",
@@ -1923,9 +1928,33 @@ def test_safe_subqueries_are_allowed():
     safe = "SELECT * FROM orders WHERE id IN (SELECT order_id FROM pay WHERE dt = '2026-10-22')"
     out = validate_and_rewrite(safe, "mysql", max_rows=200)
     assert "LIMIT 201" in out.upper()
+
+
+def test_versioned_comment_injection_is_neutralized_by_rewrite():
+    # MySQL 版本化注释 /*! ... */ 在 sqlglot 生成器重写时被规范成普通注释（/*! -> /* !），
+    # 钉死该无害化行为，防 sqlglot 升级改变生成器输出（执行器只跑重写后 SQL）
+    out = validate_and_rewrite("SELECT * FROM t /*! ; DROP TABLE t */", "mysql")
+    assert "/*!" not in out
 ```
 
-> 注：`SELECT ... INTO OUTFILE` 在 sqlglot 中体现为 Select 的 into 参数，Task 3 已拒绝；若该用例在你的 sqlglot 版本上被解析成别的结构而失败，按实际报错把断言收窄为「抛 GatewayError」（不指定 stage），并在提交信息里记录 sqlglot 版本。
+> 注 1：`SELECT ... INTO OUTFILE` 在 sqlglot 25.34.1 mysql 方言下**解析期即 ParseError**
+> （并非进入 exp.Into 扫描才拒）；Task 8 对抗复审三轮变异实证：根白名单、禁用节点扫描、
+> 语句计数三道防线各有测试钉死，无假绿。
+>
+> **Task 8 对抗式复审裁定（2026-10-25 回写）**：Approved。加厚 3 条单品 Command 根
+> （GRANT/CALL/USE）+ 1 条版本化注释中和回归（本文件 18 个测试，全量 91 passed）。
+> Backlog：
+> - **P1 `LOAD_FILE` 等文件读取函数当前 parser 放行**（实证 ALLOW）。既定架构原则是
+>   「parser 拦不住的靠只读账号兜底」——阶段 1 部署必须以基础设施保证网关账号**无 FILE
+>   权限**且 secure_file_priv 收紧；若不能保证，立即升级为 parser 函数名黑名单
+>   （LOAD_FILE/SLEEP/BENCHMARK/GET_LOCK 可同一名单，断言 stage="parse"）。
+> - SLEEP/BENCHMARK/GET_LOCK/巨型递归 CTE 等资源耗尽形态放行：server.py 已设
+>   read_timeout=30s 硬顶，语义层查询预算/配额在阶段 1 处理；GET_LOCK 另见 Task 4 M7。
+> - information_schema、@@datadir 等元数据读取：表白名单/行列权限属阶段 1 语义层，
+>   parser 层无法判别授权范围。
+> - 变异证据补充 Task 6 backlog M8：根白名单被改坏时 sqlglot Command 对象在后续
+>   .subquery() 处抛 AttributeError，不在 validator 现捕面（SqlglotError/RecursionError/
+>   ValueError）内，阶段 1 做宽兜底纵深防御时应覆盖。
 
 - [ ] **Step 2: 运行测试**
 
@@ -1933,7 +1962,9 @@ def test_safe_subqueries_are_allowed():
 pytest tests/test_malicious_sql.py -v
 ```
 
-Expected: 13 条恶意用例 + 1 条安全子查询用例全部通过（`;;;` 被解析为空语句列表，以「SQL 为空」在 parse 阶段拒绝；Task 3 实现已覆盖）。
+Expected: 16 条恶意用例（参数化）+ 安全子查询 + 版本化注释中和共 18 个测试全部通过
+（`;;;` 被解析为空语句列表，以「SQL 为空」在 parse 阶段拒绝；Task 3 实现已覆盖）。
+首版 13 条恶意用例提交为 19db2c9；对抗复审加厚在 Step 4。
 
 - [ ] **Step 3: 全量回归后提交**
 
@@ -1942,6 +1973,15 @@ pytest
 git add services/query-gateway/tests/test_malicious_sql.py
 git commit -m "test(stage0): 恶意/越权 SQL 回归用例库"
 ```
+
+- [ ] **Step 4: 对抗复审加厚后提交（GRANT/CALL/USE Command 根 + 版本化注释中和）**
+
+```bash
+git add services/query-gateway/tests/test_malicious_sql.py
+git commit -m "test(stage0): 加厚恶意 SQL 回归——单品 Command 根与版本化注释中和"
+```
+
+加厚后全量期望 91 passed（87 + 4）。
 
 ---
 
