@@ -1145,13 +1145,20 @@ _WRITE_LOCK = threading.Lock()
 
 
 def append_audit(path: str, record: dict) -> None:
-    """向 JSONL 审计文件追加一条记录，自动补 ts（调用方无法伪造/覆盖时间戳）。只追加。"""
+    """向 JSONL 审计文件追加一条记录，自动补 ts（调用方无法伪造/覆盖时间戳）。只追加。
+
+    防御性序列化（Task 6 对抗式复审 I2）：JSON-RPC 可送达孤立代理项（如 "SELECT '\\ud800'"，
+    json.loads 接受合法 \\uD800 转义），json.dumps(ensure_ascii=False) 不报错但 UTF-8 文本
+    写入会抛 UnicodeEncodeError——它是 ValueError 不是 OSError，会裸逃出审计边界。故：
+    default=str 兜底不可序列化对象；文件流 errors="backslashreplace" 保证任何 str 都能落成
+    可解码 ASCII（孤立代理项写成 \\ud800 字面量），单行始终是完整合法 JSON。
+    """
     log_path = Path(path)
     payload = {**record, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    line = json.dumps(payload, ensure_ascii=False, default=str) + "\n"
     with _WRITE_LOCK:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
+        with open(log_path, "a", encoding="utf-8", errors="backslashreplace") as f:
             f.write(line)
 ```
 
@@ -1178,6 +1185,15 @@ def test_concurrent_appends_do_not_interleave(tmp_path):
     assert len(lines) == threads_n * per_thread  # 无交错、无丢行
     for line in lines:
         json.loads(line)  # 每行都是完整合法 JSON
+
+
+def test_lone_surrogate_value_is_written_without_raising(tmp_path):
+    # 对抗式复审 I2：孤立代理项经 JSON-RPC 可达；审计写入必须不抛异常且文件仍可解码
+    log_file = tmp_path / "audit.jsonl"
+    append_audit(str(log_file), {"event": "query_submit", "sql": "SELECT 'a\ud800b'"})
+
+    records = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["event"] == "query_submit"
 ```
 
 - [ ] **Step 1: 写共享 fixture 与失败测试**
@@ -1219,12 +1235,20 @@ def demo_engine(tmp_path):
 
 ```python
 import json
+import threading
 
 from app.gateway import Gateway
 
 
 def _gateway(engine, tmp_path):
     return Gateway(engine, dialect="sqlite", audit_log=str(tmp_path / "audit.jsonl"), max_rows=200)
+
+
+def _events(tmp_path):
+    return [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def test_happy_path_returns_rows_and_audits(demo_engine, tmp_path):
@@ -1238,11 +1262,18 @@ def test_happy_path_returns_rows_and_audits(demo_engine, tmp_path):
     assert result["ok"] is True
     assert result["columns"] == ["channel", "amt"]
     assert dict(result["rows"])["app"] == 500.0
+    assert result["truncated"] is False
     assert result["executed_sql"].upper().startswith("SELECT")
 
-    events = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    events = _events(tmp_path)
     assert [e["event"] for e in events] == ["query_submit", "query_ok"]
-    assert events[0]["user"] == "tester"
+    # 对抗式复审 I1：同一请求的事件靠 request_id 配对，且全部携带 user
+    assert events[0]["user"] == events[1]["user"] == "tester"
+    assert events[0]["request_id"] == events[1]["request_id"]
+    assert len(events[0]["request_id"]) == 32
+    # query_ok 载荷钉死，防止成功事件悄悄丢字段
+    assert events[1]["rows"] == 2
+    assert events[1]["truncated"] is False
 
 
 def test_malicious_sql_returns_structured_error_not_raises(demo_engine, tmp_path):
@@ -1252,8 +1283,11 @@ def test_malicious_sql_returns_structured_error_not_raises(demo_engine, tmp_path
     assert result["ok"] is False
     assert result["stage"] == "parse"
     assert "suggestion" in result
-    events = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    events = _events(tmp_path)
     assert events[-1]["event"] == "query_rejected"
+    # 拒绝事件必须能与提交事件配对归因
+    assert events[-1]["request_id"] == events[0]["request_id"]
+    assert events[-1]["user"] == "tester"
 
 
 def test_bad_column_returns_execute_stage_error(demo_engine, tmp_path):
@@ -1279,6 +1313,13 @@ def test_audit_failure_is_fail_closed(monkeypatch, demo_engine, tmp_path):
         raise OSError("disk full")
 
     monkeypatch.setattr("app.gateway.append_audit", _raise)
+
+    # 钉死顺序：fail-closed 必须挡在校验之后、执行之前——run_query 一旦被调即测试失败
+    def _must_not_execute(*args, **kwargs):
+        raise AssertionError("审计不可用时不得执行查询")
+
+    monkeypatch.setattr("app.gateway.run_query", _must_not_execute)
+
     gw = _gateway(demo_engine, tmp_path)
 
     result = gw.run_readonly_sql("SELECT 1", user="tester")
@@ -1287,6 +1328,90 @@ def test_audit_failure_is_fail_closed(monkeypatch, demo_engine, tmp_path):
 
     assert gw.list_tables()["stage"] == "audit"
     assert gw.get_table_meta("dws_trade_order_di")["stage"] == "audit"
+
+
+def test_query_ok_audit_failure_withholds_rows(monkeypatch, demo_engine, tmp_path):
+    # 对抗式复审 I3：提交审计成功、查询已执行，但成功审计失败——结果行必须扣下
+    seen = []
+
+    def _flaky(path, record):
+        seen.append(record["event"])
+        if record["event"] == "query_ok":
+            raise OSError("disk full")
+
+    monkeypatch.setattr("app.gateway.append_audit", _flaky)
+    gw = _gateway(demo_engine, tmp_path)
+
+    result = gw.run_readonly_sql("SELECT 1 AS x", user="tester")
+
+    assert result["ok"] is False
+    assert result["stage"] == "audit"
+    assert "rows" not in result
+    assert "columns" not in result
+    assert seen == ["query_submit", "query_ok"]  # 查询确实执行了，但成功响应没放出去
+
+
+def test_rejection_audit_failure_preserves_original_error(monkeypatch, demo_engine, tmp_path):
+    # 对抗式复审 M1：拒绝事件本身审计失败时，原始 parse/execute 原因不能丢
+    def _flaky(path, record):
+        if record["event"] == "query_rejected":
+            raise OSError("disk full")
+
+    monkeypatch.setattr("app.gateway.append_audit", _flaky)
+
+    def _must_not_execute(*args, **kwargs):
+        raise AssertionError("parse 已拒绝，不得执行")
+
+    monkeypatch.setattr("app.gateway.run_query", _must_not_execute)
+
+    gw = _gateway(demo_engine, tmp_path)
+    result = gw.run_readonly_sql("DROP TABLE dws_trade_order_di", user="tester")
+
+    assert result["stage"] == "audit"
+    assert result["original_stage"] == "parse"
+    assert result["original_reason"]
+
+
+def test_lone_surrogate_sql_never_raises(demo_engine, tmp_path):
+    # 对抗式复审 I2：JSON-RPC 可送达孤立代理项；门面在任何阶段都只能返回 dict
+    gw = _gateway(demo_engine, tmp_path)
+    result = gw.run_readonly_sql("SELECT 'a\ud800b'", user="tester")
+
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert result["stage"] in ("parse", "execute", "audit")
+
+
+def test_concurrent_requests_audit_events_are_attributable(demo_engine, tmp_path):
+    # 对抗式复审 I1：并发交错时，靠 request_id+user 必须能把每条事件归到唯一请求
+    gw = _gateway(demo_engine, tmp_path)
+    outcomes = {}
+
+    def worker(user):
+        outcomes[user] = gw.run_readonly_sql(
+            "SELECT COUNT(*) AS n FROM dws_trade_order_di", user=user
+        )
+
+    threads = [threading.Thread(target=worker, args=(u,)) for u in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert {outcomes["alice"]["ok"], outcomes["bob"]["ok"]} == {True}
+
+    groups = {}
+    for event in _events(tmp_path):
+        groups.setdefault(event["request_id"], []).append(event)
+
+    assert len(groups) == 2  # 两个 request_id 不串号
+    paired_users = set()
+    for events in groups.values():
+        assert {e["event"] for e in events} == {"query_submit", "query_ok"}
+        users = {e["user"] for e in events}
+        assert len(users) == 1  # 同一 request_id 下用户一致
+        paired_users.add(next(iter(users)))
+    assert paired_users == {"alice", "bob"}
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -1302,6 +1427,8 @@ Expected: FAIL，`No module named 'app.gateway'`
 `app/gateway.py`：
 
 ```python
+import uuid
+
 from sqlalchemy.engine import Engine
 
 from app import metadata
@@ -1321,8 +1448,9 @@ class Gateway:
         self.max_rows = max_rows
 
     def list_tables(self, user: str = "anonymous") -> dict:
+        request_id = uuid.uuid4().hex
         try:
-            self._audit({"event": "metadata_list_tables", "user": user})
+            self._audit({"event": "metadata_list_tables", "request_id": request_id, "user": user})
         except GatewayError as audit_error:
             return audit_error.to_dict()
         try:
@@ -1331,66 +1459,113 @@ class Gateway:
             return error.to_dict()
 
     def get_table_meta(self, table_name: str, user: str = "anonymous") -> dict:
+        request_id = uuid.uuid4().hex
         try:
-            self._audit({"event": "metadata_get_table", "user": user, "table": table_name})
+            self._audit({
+                "event": "metadata_get_table",
+                "request_id": request_id,
+                "user": user,
+                "table": table_name,
+            })
         except GatewayError as audit_error:
             return audit_error.to_dict()
         try:
-            return {"ok": True, **metadata.get_table_meta(self.engine, table_name)}
+            return {**metadata.get_table_meta(self.engine, table_name), "ok": True}
         except GatewayError as error:
             return error.to_dict()
 
     def run_readonly_sql(self, sql: str, user: str = "anonymous") -> dict:
+        # 每次请求一个 request_id，同一次调用的 submit/ok/rejected 全事件携带它与 user
+        # （对抗式复审 I1：并发 SSE 下交错的 JSONL 行必须能配对归因）
+        request_id = uuid.uuid4().hex
         # fail-closed：提交审计写不进去就不校验、不执行（企业审计原则：不能审计就不碰数）
         try:
-            self._audit({"event": "query_submit", "user": user, "sql": sql})
+            self._audit({
+                "event": "query_submit",
+                "request_id": request_id,
+                "user": user,
+                "sql": sql,
+            })
         except GatewayError as audit_error:
             return audit_error.to_dict()
 
         try:
             safe_sql = validate_and_rewrite(sql, self.dialect, self.max_rows)
         except GatewayError as parse_error:
-            return self._reject(parse_error, stage="parse", audited_sql=sql)
+            return self._reject(parse_error, "parse", sql, request_id, user)
 
         try:
             result = run_query(self.engine, safe_sql, self.max_rows)
         except GatewayError as exec_error:
-            return self._reject(exec_error, stage="execute", audited_sql=safe_sql)
+            return self._reject(exec_error, "execute", safe_sql, request_id, user)
 
         # 查询已执行；成功审计若写不进去，宁可返回 audit 错误也不假装成功（行不返回）
         try:
             self._audit({
                 "event": "query_ok",
+                "request_id": request_id,
+                "user": user,
                 "sql": safe_sql,
                 "rows": len(result["rows"]),
                 "truncated": result["truncated"],
             })
         except GatewayError as audit_error:
             return audit_error.to_dict()
-        return {"executed_sql": safe_sql, **result}
+        return {**result, "executed_sql": safe_sql}
 
-    def _reject(self, error: GatewayError, stage: str, audited_sql: str) -> dict:
+    def _reject(
+        self,
+        error: GatewayError,
+        stage: str,
+        audited_sql: str,
+        request_id: str,
+        user: str,
+    ) -> dict:
         try:
-            self._audit({"event": "query_rejected", "stage": stage, "sql": audited_sql})
+            self._audit({
+                "event": "query_rejected",
+                "request_id": request_id,
+                "user": user,
+                "stage": stage,
+                "sql": audited_sql,
+            })
         except GatewayError as audit_error:
-            return audit_error.to_dict()
+            # 拒绝事件本身也落不了盘：返回 audit 错误，但保留原始 parse/execute 原因（M1）
+            return {
+                **audit_error.to_dict(),
+                "original_stage": stage,
+                "original_reason": error.reason,
+            }
         return error.to_dict()
 
     def _audit(self, record: dict) -> None:
         try:
             append_audit(self.audit_log, record)
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001
+            # 审计边界必须永不裸逃：OSError 之外 UnicodeEncodeError（ValueError）等实证可达，
+            # 只回显异常类名，不回显内部路径等细节（对抗式复审 I2 + M6）
             raise GatewayError(
                 "audit",
-                f"审计日志写入失败：{type(exc).__name__}: {str(exc)[:200]}",
+                f"审计日志写入失败：{type(exc).__name__}",
                 "审计不可用时查询已被拦截，请联系管理员检查审计存储",
             )
 ```
 
 > 设计决定（Task 6 前置评审）：审计写入失败 **fail-closed**——提交审计失败则查询不
 > 校验不执行；执行后成功审计失败则返回 stage="audit" 错误且不返回数据（宁可误拒，
-> 不可"跑了没记录"）。`_audit` 只把 OSError 结构化为 GatewayError，其余异常按 bug
-> 暴露，不在这里做宽兜底。
+> 不可"跑了没记录"）。
+>
+> **Task 6 对抗式复审裁定（2026-10-23 回写）**：
+> - **I1（修复）**：每次公共方法入口生成 `request_id = uuid4().hex`，submit/ok/rejected
+>   及元数据事件全部携带 request_id+user；新增双用户并发配对归因回归。
+> - **I2（修复，两层）**：audit.py 防御性序列化（`default=str` +
+>   `errors="backslashreplace"`），门面 `_audit` 由只捕 OSError 改为捕 Exception，且错误
+>   文案只含异常类名、不回显绝对路径（M6）。
+> - **M1（修复）**：拒绝事件审计再失败时，响应附带 original_stage/original_reason。
+> - **M5（顺手加固）**：成功 dict 的受信键（ok）放展开之后，防止内部载荷键覆盖。
+> - **接受为 backlog（阶段 1）**：M2 按路径分锁/mkdir 一次性化；M3 跨进程文件锁
+>   （容器单 worker 外的多进程部署）；M4 落盘 fsync 持久性；M7 元数据失败补
+>   metadata_error 结果事件；M8 validator 宽兜底纵深防御（当前 sqlglot 已知异常面已封）。
 
 - [ ] **Step 4: 运行全量单测确认通过**
 
@@ -1398,13 +1573,20 @@ class Gateway:
 pytest
 ```
 
-Expected: 全部通过 66 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 7 + gateway 5）。
+Expected: 全部通过 71 passed（smoke 1 + audit 5 + validator 38 + executor 11 + metadata 7 + gateway 9）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add services/query-gateway/app/gateway.py services/query-gateway/app/audit.py services/query-gateway/tests
 git commit -m "feat(stage0): Gateway 门面串联校验/执行/元数据/审计，工具层永不抛异常"
+```
+
+- [ ] **Step 6: 对抗式复审修复后提交（I1 归因 / I2 审计边界 / I3 测试缺口 / M1 原始原因保留）**
+
+```bash
+git add services/query-gateway/app/gateway.py services/query-gateway/app/audit.py services/query-gateway/tests
+git commit -m "fix(stage0): 审计全事件携带 request_id/user、审计写入防孤立代理项裸逃，补并发归因与 fail-closed 回归"
 ```
 
 ---
