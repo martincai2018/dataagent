@@ -1061,6 +1061,59 @@ git commit -m "feat(stage0): 表清单与表结构元数据工具"
 - Create: `app/gateway.py`
 - Test: `tests/conftest.py`
 - Test: `tests/test_gateway.py`
+- Modify: `app/audit.py`、`tests/test_audit.py`（落实 Task 2 复审挂起项：审计追加并发锁）
+
+- [ ] **Step 0: 审计追加加进程内线程锁（Task 2 复审挂起项）**
+
+MCP SSE 服务会并发处理多个请求、向同一 JSONL 追加；Windows 文本模式缓冲下并发
+write 可能交错损坏行。在 `app/audit.py` 用模块级锁包住建目录与写入（只追加、
+不跨进程；容器内单进程 uvicorn worker，跨进程留待阶段 1 评估）：
+
+```python
+import json
+import threading
+import time
+from pathlib import Path
+
+# MCP SSE 并发请求会同时追加同一审计文件：模块级锁保证一行一条完整 JSON
+_WRITE_LOCK = threading.Lock()
+
+
+def append_audit(path: str, record: dict) -> None:
+    """向 JSONL 审计文件追加一条记录，自动补 ts（调用方无法伪造/覆盖时间戳）。只追加。"""
+    log_path = Path(path)
+    payload = {**record, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with _WRITE_LOCK:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+```
+
+`tests/test_audit.py` 末尾追加并发回归：
+
+```python
+def test_concurrent_appends_do_not_interleave(tmp_path):
+    import threading
+
+    log_file = tmp_path / "audit.jsonl"
+    threads_n, per_thread = 8, 50
+
+    def worker(tid):
+        for i in range(per_thread):
+            append_audit(str(log_file), {"event": "x", "tid": tid, "i": i})
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(threads_n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == threads_n * per_thread  # 无交错、无丢行
+    for line in lines:
+        json.loads(line)  # 每行都是完整合法 JSON
+```
 
 - [ ] **Step 1: 写共享 fixture 与失败测试**
 
@@ -1152,6 +1205,22 @@ def test_metadata_tools_go_through_gateway(demo_engine, tmp_path):
 
     meta = gw.get_table_meta("dws_trade_order_di")
     assert "order_pay_amt" in [c["name"] for c in meta["columns"]]
+
+
+def test_audit_failure_is_fail_closed(monkeypatch, demo_engine, tmp_path):
+    # 审计存储不可用（磁盘满/权限）时不得继续执行：查询与元数据都返回结构化 audit 错误
+    def _raise(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("app.gateway.append_audit", _raise)
+    gw = _gateway(demo_engine, tmp_path)
+
+    result = gw.run_readonly_sql("SELECT 1", user="tester")
+    assert result["ok"] is False
+    assert result["stage"] == "audit"
+
+    assert gw.list_tables()["stage"] == "audit"
+    assert gw.get_table_meta("dws_trade_order_di")["stage"] == "audit"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -1168,7 +1237,6 @@ Expected: FAIL，`No module named 'app.gateway'`
 
 ```python
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
 
 from app import metadata
 from app.audit import append_audit
@@ -1187,44 +1255,76 @@ class Gateway:
         self.max_rows = max_rows
 
     def list_tables(self, user: str = "anonymous") -> dict:
-        self._audit({"event": "metadata_list_tables", "user": user})
+        try:
+            self._audit({"event": "metadata_list_tables", "user": user})
+        except GatewayError as audit_error:
+            return audit_error.to_dict()
         try:
             return {"ok": True, "tables": metadata.list_tables(self.engine)}
         except GatewayError as error:
             return error.to_dict()
 
     def get_table_meta(self, table_name: str, user: str = "anonymous") -> dict:
-        self._audit({"event": "metadata_get_table", "user": user, "table": table_name})
+        try:
+            self._audit({"event": "metadata_get_table", "user": user, "table": table_name})
+        except GatewayError as audit_error:
+            return audit_error.to_dict()
         try:
             return {"ok": True, **metadata.get_table_meta(self.engine, table_name)}
         except GatewayError as error:
             return error.to_dict()
 
     def run_readonly_sql(self, sql: str, user: str = "anonymous") -> dict:
-        self._audit({"event": "query_submit", "user": user, "sql": sql})
+        # fail-closed：提交审计写不进去就不校验、不执行（企业审计原则：不能审计就不碰数）
+        try:
+            self._audit({"event": "query_submit", "user": user, "sql": sql})
+        except GatewayError as audit_error:
+            return audit_error.to_dict()
+
         try:
             safe_sql = validate_and_rewrite(sql, self.dialect, self.max_rows)
         except GatewayError as parse_error:
-            self._audit({"event": "query_rejected", "stage": "parse", "sql": sql})
-            return parse_error.to_dict()
+            return self._reject(parse_error, stage="parse", audited_sql=sql)
 
         try:
             result = run_query(self.engine, safe_sql, self.max_rows)
         except GatewayError as exec_error:
-            self._audit({"event": "query_rejected", "stage": "execute", "sql": safe_sql})
-            return exec_error.to_dict()
+            return self._reject(exec_error, stage="execute", audited_sql=safe_sql)
 
-        self._audit({
-            "event": "query_ok",
-            "sql": safe_sql,
-            "rows": len(result["rows"]),
-            "truncated": result["truncated"],
-        })
+        # 查询已执行；成功审计若写不进去，宁可返回 audit 错误也不假装成功（行不返回）
+        try:
+            self._audit({
+                "event": "query_ok",
+                "sql": safe_sql,
+                "rows": len(result["rows"]),
+                "truncated": result["truncated"],
+            })
+        except GatewayError as audit_error:
+            return audit_error.to_dict()
         return {"executed_sql": safe_sql, **result}
 
+    def _reject(self, error: GatewayError, stage: str, audited_sql: str) -> dict:
+        try:
+            self._audit({"event": "query_rejected", "stage": stage, "sql": audited_sql})
+        except GatewayError as audit_error:
+            return audit_error.to_dict()
+        return error.to_dict()
+
     def _audit(self, record: dict) -> None:
-        append_audit(self.audit_log, record)
+        try:
+            append_audit(self.audit_log, record)
+        except OSError as exc:
+            raise GatewayError(
+                "audit",
+                f"审计日志写入失败：{type(exc).__name__}: {str(exc)[:200]}",
+                "审计不可用时查询已被拦截，请联系管理员检查审计存储",
+            )
 ```
+
+> 设计决定（Task 6 前置评审）：审计写入失败 **fail-closed**——提交审计失败则查询不
+> 校验不执行；执行后成功审计失败则返回 stage="audit" 错误且不返回数据（宁可误拒，
+> 不可"跑了没记录"）。`_audit` 只把 OSError 结构化为 GatewayError，其余异常按 bug
+> 暴露，不在这里做宽兜底。
 
 - [ ] **Step 4: 运行全量单测确认通过**
 
@@ -1232,12 +1332,12 @@ class Gateway:
 pytest
 ```
 
-Expected: 全部通过（smoke + audit + validator + executor + metadata + gateway）。
+Expected: 全部通过 62 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 3 + gateway 5）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add services/query-gateway/app/gateway.py services/query-gateway/tests
+git add services/query-gateway/app/gateway.py services/query-gateway/app/audit.py services/query-gateway/tests
 git commit -m "feat(stage0): Gateway 门面串联校验/执行/元数据/审计，工具层永不抛异常"
 ```
 
