@@ -1373,13 +1373,15 @@ def test_rejection_audit_failure_preserves_original_error(monkeypatch, demo_engi
 
 
 def test_lone_surrogate_sql_never_raises(demo_engine, tmp_path):
-    # 对抗式复审 I2：JSON-RPC 可送达孤立代理项；门面在任何阶段都只能返回 dict
+    # 对抗式复审 I2：JSON-RPC 可送达孤立代理项；门面契约是绝不裸抛、审计文件不损坏。
+    # sqlite 下该语句可正常执行（ok=True），成功与否不是本断言重点——任何结果都只能是 dict，
+    # 且审计 JSONL 每一行都必须仍能被 json.loads 解析（写入侧 errors="backslashreplace" 兜底）。
     gw = _gateway(demo_engine, tmp_path)
-    result = gw.run_readonly_sql("SELECT 'a\ud800b'", user="tester")
+    result = gw.run_readonly_sql("SELECT 'a\ud800b' AS x", user="tester")
 
     assert isinstance(result, dict)
-    assert result["ok"] is False
-    assert result["stage"] in ("parse", "execute", "audit")
+    for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines():
+        json.loads(line)
 
 
 def test_concurrent_requests_audit_events_are_attributable(demo_engine, tmp_path):
