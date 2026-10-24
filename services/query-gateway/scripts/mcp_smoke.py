@@ -9,7 +9,14 @@ URL = "http://127.0.0.1:8000/sse"
 
 
 def _content_to_obj(result):
-    return json.loads(result.content[0].text)
+    # MCP 层错误（非 Gateway 结构化返回）在 mcp 1.2.0 会以 isError/异常形式出现：
+    # 给出可读失败信息，而不是让 content[0] 抛无上下文的 IndexError
+    if getattr(result, "isError", False):
+        raise AssertionError(f"工具返回 MCP 错误：{result.content}")
+    try:
+        return json.loads(result.content[0].text)
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"无法解析工具返回：{result.content!r}") from exc
 
 
 async def main():
