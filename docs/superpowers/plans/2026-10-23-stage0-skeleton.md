@@ -1194,7 +1194,8 @@ def demo_engine(tmp_path):
                 "(id, channel, city, order_pay_amt, order_status, pay_time, dt) "
                 f"VALUES {row}"
             ))
-    return engine
+    yield engine
+    engine.dispose()  # Windows tmp_path 回收要求（同 executor/metadata fixture）
 ```
 
 `tests/test_gateway.py`：
