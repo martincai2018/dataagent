@@ -519,6 +519,9 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
     """校验 SQL 只读、单语句，并注入/收敛 LIMIT。返回重写后的 SQL。
 
     任何违规都抛 GatewayError(stage="parse")，suggestion 供 Agent 自纠。
+
+    注意：返回的 SQL 只能交给 app.executor.run_query 执行——注入的是 max_rows+1
+    哨兵，由执行器切片保证最多返回 max_rows 行；任何其他消费方不得直接执行本函数输出。
     """
     if not isinstance(sql, str) or not sql.strip() or "\x00" in sql:
         raise GatewayError("parse", "SQL 为空或含非法字符", "提交一条 SELECT 查询")
@@ -782,6 +785,19 @@ def test_jsonable_conversions():
     assert _jsonable(42) == 42
     assert _jsonable(True) is True
     assert _jsonable(b"\x01") == "01"
+    # timedelta 边界：负半秒符号与微秒都不丢；timedelta.max 量级无宽度问题
+    assert _jsonable(timedelta(seconds=-0.5)) == "-00:00:00.500000"
+    assert _jsonable(timedelta.max) == "24000000000:00:00.999999"
+
+
+def test_payload_roundtrips_strict_json(orders_engine):
+    # 整个返回载荷必须能被严格 JSON 序列化（allow_nan=False）：
+    # SQLite 1e999 → inf 经 _jsonable 收敛为 None，不得产出 Infinity 非法 token
+    import json
+
+    result = run_query(orders_engine, "SELECT 1e999 AS huge, x'01' AS blob", max_rows=5)
+    assert result["rows"] == [[None, "01"]]
+    json.dumps(result, allow_nan=False)  # 不抛即通过
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -892,7 +908,7 @@ def _timedelta_to_mysql_time(value: datetime.timedelta) -> str:
 pytest tests/test_executor.py
 ```
 
-Expected: `10 passed`
+Expected: `11 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1826,6 +1842,15 @@ git commit -m "docs(stage0): 端到端验收记录"
 1. SQL 能否执行
 2. 执行结果集与 expected_result_features 的集合比对（顺序无关）
 3. 图表/维度类型规则判定
+
+### 结果集比对的类型归一化（Task 4 复审 Minor）
+
+网关 `_jsonable` 会改变部分 Python 类型，比对器必须在比较前做归一化，否则会静默失配：
+
+- 绝对值超 2^53 的 BIGINT（如雪花 ID）返回**字符串**保精度 → 大整数列统一按字符串比对
+- Decimal/DECIMAL 转 float，高精度金额可能丢末位 → 金额列按容差（如 abs 差 < 1e-6 或相对误差）比对
+- 非有限值（inf/NaN）与 PG numeric sNaN 分别归一化为 null / 字符串
+- MySQL TIME 返回 "HH:MM:SS" 字符串；date/datetime 为 ISO 字符串
 ```
 
 - [ ] **Step 2: 写 10 条针对种子数据的样例题**
