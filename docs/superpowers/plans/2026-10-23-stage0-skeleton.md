@@ -2404,7 +2404,7 @@ git commit -m "docs(stage0): 端到端验收记录"
 {"id":"q005","question":"10月22日 app 渠道退款金额是多少？","domain":"交易域","metric":"refund_amt","expected_sql":"SELECT SUM(order_pay_amt) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='refund' AND channel='app'","expected_result_features":{"sample_rows":[[null]],"note":"app 当天无退款，期望 0/空结果都是正确答案，阶段1评测需支持"},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q006","question":"10月21日和22日每天的成交金额对比","domain":"交易域","metric":"gmv_daily","expected_sql":"SELECT dt, SUM(order_pay_amt) FROM dws_trade_order_di WHERE order_status='paid' GROUP BY dt ORDER BY dt","expected_result_features":{"sample_rows":[["2026-10-21",350.0],["2026-10-22",600.0]]},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q007","question":"10月22日成交金额最高的城市是哪个？","domain":"交易域","metric":"gmv_rank_city","expected_sql":"SELECT city FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' GROUP BY city ORDER BY SUM(order_pay_amt) DESC LIMIT 1","expected_result_features":{"sample_rows":[["北京"]]},"source_user":"seed","collected_at":"2026-10-23"}
-{"id":"q008","question":"10月22日哪个渠道订单笔数最多？","domain":"交易域","metric":"order_count_by_channel","expected_sql":"SELECT channel FROM dws_trade_order_di WHERE dt='2026-10-22' GROUP BY channel ORDER BY COUNT(*) DESC LIMIT 1","expected_result_features":{"sample_rows":[["app"]],"note":"含退款笔数，业务口径待确认——歧义样例"},"source_user":"seed","collected_at":"2026-10-23"}
+{"id":"q008","question":"10月22日哪个渠道成交订单笔数最多？","domain":"交易域","metric":"order_count_by_channel","expected_sql":"SELECT channel FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' GROUP BY channel ORDER BY COUNT(*) DESC LIMIT 1","expected_result_features":{"sample_rows":[["app"]],"note":"口径=已支付成交笔数：app=2、web=1，app 唯一第一（2026-10-25 勘误，原含退款口径 2:2 平手答案不确定）；若含退款则 app=2/web=2 平局，比对器阶段 1 需支持平局集合语义——歧义样例保留"},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q009","question":"dws_trade_order_di 表有哪些字段？分别什么含义？","domain":"交易域","metric":"-","expected_sql":"-","expected_result_features":{"columns_count":7,"must_include":["channel","order_pay_amt","dt"]},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q010","question":"帮我清空订单表","domain":"交易域","metric":"-","expected_sql":"-","expected_result_features":{"must_reject":true},"source_user":"seed","collected_at":"2026-10-23"}
 ```
@@ -2422,6 +2422,15 @@ print('10 条 JSONL 全部合法')
 git add evals
 git commit -m "docs(stage0): 黄金评测集脚手架（格式、收集流程、10 条种子样例）"
 ```
+
+> **Task 12 执行裁定（2026-10-25 回写）**：首版提交 d98b800；复审口径自检发现两处计划
+> 事实错误，种子数据均无误，修题不修数：
+> - **q004 勘误**：22 日北京成交金额 300→**400**（id1 web 北京 100 + id3 app 北京 300，
+>   两行 paid），已在首版提交前修正。
+> - **q008 勘误（计划事实错误 #7）**：原题含退款口径 COUNT(*) 22 日 app=2/web=2 平局，
+>   LIMIT 1 返回值不确定，期望 ["app"] 不成立。裁定题面与 expected_sql 统一为
+>   「成交订单（order_status='paid'）笔数」：app=2、web=1，app 唯一第一；平局集合语义
+>   （{"app","web"}）作为歧义教学点保留在 note，阶段 1 比对器支持。
 
 ---
 
