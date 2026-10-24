@@ -1996,6 +1996,17 @@ git add deploy/seed/init_demo.sql
 git commit -m "chore(stage0): demo 交易库种子数据"
 ```
 
+> **Task 9 执行裁定（2026-10-25 回写）**：
+> - 本机无 Docker，Step 2 真实 MySQL 8.0 容器验证**挂起**，随 Task 10 环境就绪后补做
+>   （建表/INSERT 实际执行、utf8mb4 中文 COMMENT 落库、SUM 空集 NULL 行为）。
+> - 已完成的替代验证（提交 9c66d7a）：sqlglot 25.34.1 mysql 方言解析全文件成功
+>   （2 语句、7 列、8 行 VALUES、表级与列级 COMMENT 逐字保留无 warning）；8 行数据
+>   Decimal 精确聚合口径自检。实际提交信息为
+>   「feat(stage0): demo 交易域种子数据（MySQL 容器执行验证待 Docker 环境补做）」。
+> - **勘误（计划事实错误 #6）**：Task 12 种子题 q004「22 日北京成交金额」期望原写 300，
+>   实际北京当日有 id1 web 100 + id3 app 300 两行 paid=400；种子数据正确，已修 q004 为 400。
+>   其余种子题口径复核无误（app=500、web=100、22 日 paid 3 笔/600、21 日 350、最高城市北京）。
+
 ---
 
 ### Task 10: 容器化（网关镜像 + compose + DB-GPT 配置）
@@ -2349,7 +2360,7 @@ git commit -m "docs(stage0): 端到端验收记录"
 {"id":"q001","question":"现在数仓里有哪些表？","domain":"交易域","metric":"-","expected_sql":"SHOW TABLES","expected_result_features":{"table_names":["dws_trade_order_di"]},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q002","question":"2026年10月22日各渠道成交金额是多少？只算已支付的","domain":"交易域","metric":"gmv","expected_sql":"SELECT channel, SUM(order_pay_amt) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' GROUP BY channel","expected_result_features":{"columns":["channel","SUM(order_pay_amt)"],"sample_rows":[["app",500.0],["web",100.0]]},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q003","question":"10月22日有多少笔已支付订单？","domain":"交易域","metric":"paid_order_count","expected_sql":"SELECT COUNT(*) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid'","expected_result_features":{"sample_rows":[[3]]},"source_user":"seed","collected_at":"2026-10-23"}
-{"id":"q004","question":"10月22日北京的成交金额","domain":"交易域","metric":"gmv_by_city","expected_sql":"SELECT SUM(order_pay_amt) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' AND city='北京'","expected_result_features":{"sample_rows":[[300.0]]},"source_user":"seed","collected_at":"2026-10-23"}
+{"id":"q004","question":"10月22日北京的成交金额","domain":"交易域","metric":"gmv_by_city","expected_sql":"SELECT SUM(order_pay_amt) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' AND city='北京'","expected_result_features":{"sample_rows":[[400.0]],"note":"北京当日两行 paid：id1 web 100 + id3 app 300 = 400（2026-10-25 勘误，原值 300 漏算 web 行）"},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q005","question":"10月22日 app 渠道退款金额是多少？","domain":"交易域","metric":"refund_amt","expected_sql":"SELECT SUM(order_pay_amt) FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='refund' AND channel='app'","expected_result_features":{"sample_rows":[[null]],"note":"app 当天无退款，期望 0/空结果都是正确答案，阶段1评测需支持"},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q006","question":"10月21日和22日每天的成交金额对比","domain":"交易域","metric":"gmv_daily","expected_sql":"SELECT dt, SUM(order_pay_amt) FROM dws_trade_order_di WHERE order_status='paid' GROUP BY dt ORDER BY dt","expected_result_features":{"sample_rows":[["2026-10-21",350.0],["2026-10-22",600.0]]},"source_user":"seed","collected_at":"2026-10-23"}
 {"id":"q007","question":"10月22日成交金额最高的城市是哪个？","domain":"交易域","metric":"gmv_rank_city","expected_sql":"SELECT city FROM dws_trade_order_di WHERE dt='2026-10-22' AND order_status='paid' GROUP BY city ORDER BY SUM(order_pay_amt) DESC LIMIT 1","expected_result_features":{"sample_rows":[["北京"]]},"source_user":"seed","collected_at":"2026-10-23"}
