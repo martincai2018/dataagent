@@ -19,6 +19,11 @@ MALICIOUS = [
     "CREATE VIEW v AS SELECT 1",
     # 落表类
     "SELECT * INTO OUTFILE '/tmp/x.csv' FROM t",
+    # 单语句 Command 根（Task 8 对抗复审加厚）：sqlglot 把 GRANT/CALL/USE 等解析为
+    # exp.Command 家族，根白名单拒绝；此前整库仅 RENAME 一条单品钉住该家族
+    "GRANT SELECT ON *.* TO x",
+    "CALL some_proc(1)",
+    "USE demo",
     # 空白/异常
     "",
     ";;;",
@@ -37,3 +42,10 @@ def test_safe_subqueries_are_allowed():
     safe = "SELECT * FROM orders WHERE id IN (SELECT order_id FROM pay WHERE dt = '2026-10-22')"
     out = validate_and_rewrite(safe, "mysql", max_rows=200)
     assert "LIMIT 201" in out.upper()
+
+
+def test_versioned_comment_injection_is_neutralized_by_rewrite():
+    # MySQL 版本化注释 /*! ... */ 在 sqlglot 生成器重写时被规范成普通注释（/*! -> /* !），
+    # 钉死该无害化行为，防 sqlglot 升级改变生成器输出（执行器只跑重写后 SQL）
+    out = validate_and_rewrite("SELECT * FROM t /*! ; DROP TABLE t */", "mysql")
+    assert "/*!" not in out
