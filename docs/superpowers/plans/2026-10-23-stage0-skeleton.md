@@ -1267,7 +1267,7 @@ def test_bad_column_returns_execute_stage_error(demo_engine, tmp_path):
 def test_metadata_tools_go_through_gateway(demo_engine, tmp_path):
     gw = _gateway(demo_engine, tmp_path)
     tables = gw.list_tables()
-    assert {t["name"] for t in tables} == {"dws_trade_order_di"}
+    assert {t["name"] for t in tables["tables"]} == {"dws_trade_order_di"}
 
     meta = gw.get_table_meta("dws_trade_order_di")
     assert "order_pay_amt" in [c["name"] for c in meta["columns"]]
