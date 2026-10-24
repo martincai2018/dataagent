@@ -1598,16 +1598,24 @@ git commit -m "fix(stage0): 审计全事件携带 request_id/user、审计写入
 **Files:**
 - Create: `app/server.py`
 - Create: `scripts/mcp_smoke.py`
+- Test: `tests/test_server.py`
 
 - [ ] **Step 1: 实现 MCP Server**
 
 `app/server.py`：
 
 ```python
-"""查询网关 MCP 入口。启动：python -m app.server（默认 SSE，0.0.0.0:8000，端点 /sse）"""
+"""查询网关 MCP 入口。启动：python -m app.server
+
+默认 SSE，端点 /sse。绑定地址由 HOST 环境变量控制（默认 127.0.0.1 仅本机；
+容器/compose 显式给 HOST=0.0.0.0 且不向宿主机发布端口，只走内部网络）。
+端口由 PORT 环境变量控制（默认 8000）。
+"""
+import functools
 import os
 import time
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -1615,16 +1623,29 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import get_settings
 from app.gateway import Gateway
 
+# DB-GPT 代具身份：Stage 0 所有工具调用统一记为 dbgpt；阶段 1 由 DB-GPT 侧透传真实用户
+_TOOL_USER = "dbgpt"
+
 mcp = FastMCP("dataagent-query-gateway")
 _settings = get_settings()
 
 
-def _connect_with_retry(db_url: str, attempts: int = 15, wait_seconds: float = 2.0):
+def _engine_kwargs(db_url: str) -> dict:
+    """PyMySQL 超时：不可达实例与跑不出来的只读 SELECT 都不得无限期挂住工作线程。
+
+    其余引擎的超时参数各异（sqlite 不接受这些键），阶段 1 按引擎补全。
+    """
+    if db_url.startswith(("mysql://", "mysql+")):
+        return {"connect_args": {"connect_timeout": 5, "read_timeout": 30}}
+    return {}
+
+
+def _connect_with_retry(db_url: str, attempts: int = 15, wait_seconds: float = 2.0, **engine_kwargs):
     """容器场景下等待 demo-mysql 就绪。"""
     last_error = None
     for _ in range(attempts):
         try:
-            engine = create_engine(db_url, pool_pre_ping=True)
+            engine = create_engine(db_url, pool_pre_ping=True, **engine_kwargs)
             with engine.connect():
                 return engine
         except SQLAlchemyError as exc:
@@ -1634,7 +1655,7 @@ def _connect_with_retry(db_url: str, attempts: int = 15, wait_seconds: float = 2
 
 
 _gateway = Gateway(
-    engine=_connect_with_retry(_settings.db_url),
+    engine=_connect_with_retry(_settings.db_url, **_engine_kwargs(_settings.db_url)),
     dialect=_settings.sql_dialect,
     audit_log=_settings.audit_log,
     max_rows=_settings.max_rows,
@@ -1642,30 +1663,53 @@ _gateway = Gateway(
 
 
 @mcp.tool()
-def list_tables() -> dict:
+async def list_tables() -> dict:
     """列出业务数仓中所有可以查询的表，返回每张表的名称与注释。问数前应先调用。"""
-    return _gateway.list_tables()
+    # 同步 DB/审计调用卸到工作线程：mcp 1.2.0 的同步工具会被内联在事件循环线程执行，
+    # 一条慢查询会冻僵所有 SSE 会话（Task 7 对抗式复审 I1）。
+    return await anyio.to_thread.run_sync(
+        functools.partial(_gateway.list_tables, user=_TOOL_USER)
+    )
 
 
 @mcp.tool()
-def get_table_meta(table_name: str) -> dict:
+async def get_table_meta(table_name: str) -> dict:
     """获取指定表的字段结构（字段名、类型、注释）。生成 SQL 前必须先查看字段。table_name 为精确表名。"""
-    return _gateway.get_table_meta(table_name)
+    return await anyio.to_thread.run_sync(
+        functools.partial(_gateway.get_table_meta, table_name, user=_TOOL_USER)
+    )
 
 
 @mcp.tool()
-def run_readonly_sql(sql: str) -> dict:
+async def run_readonly_sql(sql: str) -> dict:
     """在数仓上执行只读 SELECT 查询（自动注入 LIMIT 201 哨兵，最多返回 200 行）。
     成功返回 {ok, columns, rows, truncated, executed_sql}；
     失败返回 {ok:false, stage, reason, suggestion}，应按 suggestion 修正后重试。"""
-    return _gateway.run_readonly_sql(sql, user="dbgpt")
+    return await anyio.to_thread.run_sync(
+        functools.partial(_gateway.run_readonly_sql, sql, user=_TOOL_USER)
+    )
 
 
 if __name__ == "__main__":
-    mcp.settings.host = "0.0.0.0"
+    mcp.settings.host = os.getenv("HOST", "127.0.0.1")
     mcp.settings.port = int(os.getenv("PORT", "8000"))
     mcp.run(transport="sse")
 ```
+
+> **Task 7 对抗式复审裁定（2026-10-25 回写）**：
+> - **I1（修复）**：mcp 1.2.0 对同步 `def` 工具在事件循环线程内联执行（源码 + 双会话实测：
+>   慢查询期间其他 SSE 会话的握手/工具调用全部排队）。三个工具改 async +
+>   `anyio.to_thread.run_sync` 卸线程；Gateway 无共享可变状态、Engine/QueuePool 线程安全。
+>   MySQL engine 加 connect_timeout=5/read_timeout=30（按 URL scheme 条件注入，sqlite 不传）。
+> - **I2（修复）**：元数据工具原先漏传 user，审计里同一会话出现 anonymous/dbgpt 两个身份；
+>   三个工具统一经 `_TOOL_USER="dbgpt"` 显式传参（阶段 1 统一替换为真实用户透传）。
+> - **B1（修复）**：HOST 环境变量化、默认绑 127.0.0.1；compose 显式 HOST=0.0.0.0 且不发布
+>   gateway 端口（见 Task 10 compose 回写）。
+> - **M1（修复）**：mcp_smoke.py 解析结果前检查 isError 并包住 JSONDecodeError。
+> - **接受为 backlog**：I3 导入期阻塞连接（Task 10 用健康检查 start_period 60s 收口，见 Task 10）；
+>   B2 SSE 层多客户端并发集成测试（先用 tests/test_server.py 钉死 async 形态）；M2 双通道配置、
+>   M3 attempts=0 的 last_error、M4 全局 engine 无 dispose。B3（所谓 PyMySQL 1.4.6）经 pip show
+>   实测为 1.1.1，系复审误报，驳回。
 
 - [ ] **Step 2: 写 MCP 客户端冒烟脚本**
 
@@ -1683,7 +1727,14 @@ URL = "http://127.0.0.1:8000/sse"
 
 
 def _content_to_obj(result):
-    return json.loads(result.content[0].text)
+    # MCP 层错误（非 Gateway 结构化返回）在 mcp 1.2.0 会以 isError/异常形式出现：
+    # 给出可读失败信息，而不是让 content[0] 抛无上下文的 IndexError
+    if getattr(result, "isError", False):
+        raise AssertionError(f"工具返回 MCP 错误：{result.content}")
+    try:
+        return json.loads(result.content[0].text)
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"无法解析工具返回：{result.content!r}") from exc
 
 
 async def main():
@@ -1738,7 +1789,8 @@ with e.begin() as c:
 DB_URL="sqlite:///demo.db" SQL_DIALECT=sqlite AUDIT_LOG=logs/audit.jsonl python -m app.server
 ```
 
-Expected: 日志出现 `Uvicorn running on http://0.0.0.0:8000`（FastMCP SSE 模式）。
+Expected: 日志出现 `Uvicorn running on http://127.0.0.1:8000`（默认仅绑本机；容器部署时
+用 `HOST=0.0.0.0`，见 Task 10）。
 
 - [ ] **Step 4: 跑冒烟脚本（终端 B）**
 
@@ -1755,13 +1807,70 @@ Expected:
 - `QUERY:` 返回 `n = 3`
 - `BLOCK_OK:` 显示 `ok: False, stage: 'parse'`
 
-- [ ] **Step 5: 确认审计文件有内容后停掉服务（Ctrl+C），提交**
+- [ ] **Step 5: 确认审计身份一致后停掉服务（Ctrl+C），提交**
 
 ```bash
-cat logs/audit.jsonl 2>/dev/null | head -5   # 应看到 query_submit / query_ok / query_rejected
+cat logs/audit.jsonl 2>/dev/null | head -6   # 六类事件，全部 user=dbgpt（I2），按 request_id 配对
 git add services/query-gateway/app/server.py services/query-gateway/scripts
 git commit -m "feat(stage0): FastMCP SSE 服务入口与独立冒烟脚本"
 ```
+
+- [ ] **Step 6: 写 tests/test_server.py（钉死 async 卸线程形态 + 装配冒烟）**
+
+`tests/test_server.py`：
+
+```python
+"""Task 7 对抗式复审 I1/B2：SSE 工具必须是 async（卸到工作线程执行），且导入期装配可用。
+
+app.server 在导入期即创建 engine 并连接（I3，Task 10 健康检查配合），故本模块在导入
+app.server 之前把 DB_URL 指向内存 sqlite、AUDIT_LOG 指向临时文件，避免工作目录落库。
+"""
+import asyncio
+import inspect
+import os
+import tempfile
+
+if "DB_URL" not in os.environ:
+    os.environ["DB_URL"] = "sqlite://"
+if "AUDIT_LOG" not in os.environ:
+    os.environ["AUDIT_LOG"] = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+
+from app import server  # noqa: E402
+
+
+def test_tools_are_async_coroutines():
+    # FastMCP 的 @mcp.tool() 原样返回函数本身；同步工具会被内联在事件循环线程执行
+    # （慢查询冻僵所有 SSE 会话），async+to_thread 形态由本测试钉死
+    assert inspect.iscoroutinefunction(server.list_tables)
+    assert inspect.iscoroutinefunction(server.get_table_meta)
+    assert inspect.iscoroutinefunction(server.run_readonly_sql)
+
+
+def test_async_tools_roundtrip_against_inmemory_db():
+    tables = asyncio.run(server.list_tables())
+    assert tables["ok"] is True
+    assert tables["tables"] == []  # 内存库无表，只验证 async 工具到 Gateway 的装配
+
+    result = asyncio.run(server.run_readonly_sql("SELECT 1 AS x"))
+    assert result["ok"] is True
+    assert result["columns"] == ["x"]
+    assert result["rows"] == [[1]]
+```
+
+Expected: `pytest tests/test_server.py` 2 passed。注意 pytest 收集期会导入全部测试模块，
+本文件设置的进程级 env 不影响其他测试（只有 app.server 读这些变量，其他测试不导入它）。
+
+- [ ] **Step 7: 对抗式复审修复后提交（I1 异步卸线程+超时 / I2 统一 dbgpt 身份 / B1 默认绑本机 / M1 冒烟加固）**
+
+```bash
+git add services/query-gateway/app/server.py services/query-gateway/scripts/mcp_smoke.py services/query-gateway/tests/test_server.py
+git commit -m "fix(stage0): SSE 工具异步卸线程防慢查询拒阻、统一审计身份 dbgpt、默认仅绑本机，补 server 装配测试"
+```
+
+修复后全量期望 73 passed（在 71 基础上新增 server 2 个）。修复者还需用一次性脚本实证
+**并发不阻塞**（不入库）：起服后用 asyncio.gather 并发发起一条数秒的递归 CTE 慢查询与
+一次 list_tables，断言元数据调用在慢查询执行期间即返回（耗时远小于慢查询、两者总耗时
+接近慢查询时长而非两者之和）。
 
 ---
 
@@ -1970,6 +2079,12 @@ services:
     command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     volumes:
       - ./seed/init_demo.sql:/docker-entrypoint-initdb.d/init_demo.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      start_period: 40s
+      interval: 5s
+      timeout: 5s
+      retries: 12
     networks: [agentnet]
     restart: unless-stopped
 
@@ -1982,12 +2097,21 @@ services:
       SQL_DIALECT: mysql
       MAX_ROWS: "200"
       AUDIT_LOG: /logs/audit.jsonl
+      HOST: "0.0.0.0"   # 容器内绑全部网卡；不对宿主机发布端口（Task 7 B1），仅 agentnet 可达
       PORT: "8000"
     volumes:
       - gateway-logs:/logs
-    ports:
-      - "8000:8000"
-    depends_on: [demo-db]
+    # 不做 ports: 发布——网关是 DB-GPT 的内部工具出口，宿主/局域网不应直连
+    depends_on:
+      demo-db:
+        condition: service_healthy
+    healthcheck:
+      # /sse 立即响应 SSE 响应头后保持流打开；urlopen 拿到 200 头即返回退出
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/sse', timeout=3).status==200 else 1)"]
+      start_period: 60s   # Task 7 I3：导入期 _connect_with_retry 最坏阻塞数十秒，期间端口不监听
+      interval: 10s
+      timeout: 5s
+      retries: 6
     networks: [agentnet]
     restart: unless-stopped
 
@@ -2037,7 +2161,9 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Expected: 三个容器均为 running（dbgpt 首次启动会初始化 SQLite，可能 restart 1-2 次，属正常）。
+Expected: demo-db 与 gateway 最终为 running/healthy（gateway 有 start_period 60s 健康检查
+窗口，导入期等待 MySQL 期间显示 starting 属正常；Task 7 I3）；dbgpt running（首次启动会
+初始化 SQLite，可能 restart 1-2 次，属正常）。网关不对宿主机发布端口（Task 7 B1）。
 
 - [ ] **Step 6: 验证网关在 compose 网络内可用**
 
@@ -2045,7 +2171,12 @@ Expected: 三个容器均为 running（dbgpt 首次启动会初始化 SQLite，�
 docker compose logs --tail=30 gateway
 ```
 
-Expected: 网关日志显示 SSE 监听 8000、数据库连接重试成功后无报错。
+Expected: 网关日志显示 SSE 监听 0.0.0.0:8000、数据库连接重试成功后无报错。
+更强的功能验证可在网关容器内跑冒烟脚本（URL 默认 127.0.0.1:8000）：
+
+```bash
+docker compose exec gateway python scripts/mcp_smoke.py
+```
 
 可选（拉不到 curlimages 镜像就跳过，Task 11 会做真实连通验证）：
 
