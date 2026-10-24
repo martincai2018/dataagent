@@ -21,6 +21,9 @@ def validate_and_rewrite(sql: str, dialect: str, max_rows: int = 200) -> str:
     """校验 SQL 只读、单语句，并注入/收敛 LIMIT。返回重写后的 SQL。
 
     任何违规都抛 GatewayError(stage="parse")，suggestion 供 Agent 自纠。
+
+    注意：返回的 SQL 只能交给 app.executor.run_query 执行——注入的是 max_rows+1
+    哨兵，由执行器切片保证最多返回 max_rows 行；任何其他消费方不得直接执行本函数输出。
     """
     if not isinstance(sql, str) or not sql.strip() or "\x00" in sql:
         raise GatewayError("parse", "SQL 为空或含非法字符", "提交一条 SELECT 查询")

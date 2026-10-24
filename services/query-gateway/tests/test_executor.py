@@ -148,3 +148,16 @@ def test_jsonable_conversions():
     assert _jsonable(42) == 42
     assert _jsonable(True) is True
     assert _jsonable(b"\x01") == "01"
+    # timedelta 边界：负半秒符号与微秒都不丢；timedelta.max 量级无宽度问题
+    assert _jsonable(timedelta(seconds=-0.5)) == "-00:00:00.500000"
+    assert _jsonable(timedelta.max) == "24000000000:00:00.999999"
+
+
+def test_payload_roundtrips_strict_json(orders_engine):
+    # 整个返回载荷必须能被严格 JSON 序列化（allow_nan=False）：
+    # SQLite 1e999 → inf 经 _jsonable 收敛为 None，不得产出 Infinity 非法 token
+    import json
+
+    result = run_query(orders_engine, "SELECT 1e999 AS huge, x'01' AS blob", max_rows=5)
+    assert result["rows"] == [[None, "01"]]
+    json.dumps(result, allow_nan=False)  # 不抛即通过
