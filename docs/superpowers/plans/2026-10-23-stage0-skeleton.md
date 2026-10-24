@@ -937,41 +937,70 @@ git commit -m "feat(stage0): SQLAlchemy 查询执行器（截断标记、JSON �
 `tests/test_metadata.py`：
 
 ```python
-from sqlalchemy import create_engine, text
+import pytest
+from sqlalchemy import create_engine, inspect, text
 
 from app.errors import GatewayError
 from app.metadata import get_table_meta, list_tables
 
 
-def _engine(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'meta.db'}")
-    with engine.begin() as conn:
+@pytest.fixture
+def engine(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'meta.db'}")
+    with eng.begin() as conn:
         conn.execute(text("CREATE TABLE orders (id INTEGER, channel TEXT)"))
         conn.execute(text("CREATE TABLE users (id INTEGER, name TEXT)"))
-    return engine
+    yield eng
+    eng.dispose()  # Windows 下不 dispose 会让 tmp_path 回收偶发失败（复审 I-1，同 executor M6）
 
 
-def test_list_tables_returns_all_table_names(tmp_path):
-    tables = list_tables(_engine(tmp_path))
-    names = {t["name"] for t in tables}
-    assert names == {"orders", "users"}
-    assert "comment" in tables[0]
+def test_list_tables_returns_all_table_names(engine):
+    tables = list_tables(engine)
+    assert {t["name"] for t in tables} == {"orders", "users"}
+    assert all("comment" in t for t in tables)
 
 
-def test_get_table_meta_returns_columns(tmp_path):
-    meta = get_table_meta(_engine(tmp_path), "orders")
+def test_get_table_meta_returns_columns(engine):
+    meta = get_table_meta(engine, "orders")
     assert meta["table"] == "orders"
     assert [c["name"] for c in meta["columns"]] == ["id", "channel"]
     assert meta["columns"][0]["type"]  # 类型非空
 
 
-def test_get_table_meta_unknown_table_raises(tmp_path):
+def test_get_table_meta_unknown_table_raises(engine):
+    with pytest.raises(GatewayError) as exc:
+        get_table_meta(engine, "nope")
+    assert exc.value.stage == "metadata"
+    assert "共 2 张" in exc.value.suggestion  # 锁定给 Agent 的自纠契约
+
+
+def test_identifier_injection_is_blocked_by_gate(engine):
+    # 白名单 gate 是真正的防线：任何不等于现有表名的载荷都在反射 SQL 构造前拒绝
+    with pytest.raises(GatewayError) as exc:
+        get_table_meta(engine, "x'; DROP TABLE orders --")
+    assert exc.value.stage == "metadata"
+    assert inspect(engine).has_table("orders")  # 表安然无恙
+
+
+def test_broken_engine_raises_structured_metadata_error(tmp_path):
+    bad_engine = create_engine(f"sqlite:///{tmp_path / 'not_a_dir' / 'meta.db'}")
     try:
-        get_table_meta(_engine(tmp_path), "nope")
-    except GatewayError as exc:
-        assert exc.stage == "metadata"
-    else:
-        raise AssertionError("应当抛 GatewayError")
+        with pytest.raises(GatewayError) as exc:
+            list_tables(bad_engine)
+        assert exc.value.stage == "metadata"
+    finally:
+        bad_engine.dispose()
+
+
+def test_non_sqlalchemy_error_is_structured(monkeypatch, engine):
+    # 非 SQLAlchemyError（实证：无默认库时 MySQL 方言会抛 AttributeError）也不得裸逃
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected reflection failure")
+
+    monkeypatch.setattr("app.metadata.inspect", _boom)
+    with pytest.raises(GatewayError) as exc:
+        list_tables(engine)
+    assert exc.value.stage == "metadata"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -1001,11 +1030,20 @@ def list_tables(engine: Engine) -> list[dict]:
         for name in inspector.get_table_names():
             tables.append({"name": name, "comment": _table_comment(inspector, name)})
         return tables
+    except GatewayError:
+        raise
     except SQLAlchemyError as exc:
         raise GatewayError("metadata", f"读取表清单失败：{str(exc)[:200]}", "稍后重试或联系管理员")
+    except Exception as exc:  # noqa: BLE001 - 网关契约：非 SQLAlchemyError 也结构化，不回显内部细节
+        raise GatewayError("metadata", f"读取表清单失败：{type(exc).__name__}", "稍后重试或联系管理员")
 
 
 def get_table_meta(engine: Engine, table_name: str) -> dict:
+    """取单表结构。table_name 必须与 list_tables 返回的表名逐字一致（区分大小写）。
+
+    标识符注入由两道独立防线封死：先白名单精确匹配（不匹配即结构化拒绝），
+    通过后方言反射对表名强制加引号（MySQL 反引号/SQLite 双引号）。
+    """
     try:
         inspector = inspect(engine)
         available = set(inspector.get_table_names())
@@ -1020,8 +1058,12 @@ def get_table_meta(engine: Engine, table_name: str) -> dict:
             for col in inspector.get_columns(table_name)
         ]
         return {"table": table_name, "comment": _table_comment(inspector, table_name), "columns": columns}
+    except GatewayError:
+        raise
     except SQLAlchemyError as exc:
         raise GatewayError("metadata", f"读取表结构失败：{str(exc)[:200]}", "稍后重试或联系管理员")
+    except Exception as exc:  # noqa: BLE001 - 网关契约：非 SQLAlchemyError 也结构化，不回显内部细节
+        raise GatewayError("metadata", f"读取表结构失败：{type(exc).__name__}", "稍后重试或联系管理员")
 
 
 def _table_comment(inspector, table_name: str):
@@ -1044,7 +1086,7 @@ def _table_comment(inspector, table_name: str):
 pytest tests/test_metadata.py
 ```
 
-Expected: `3 passed`
+Expected: `6 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1052,6 +1094,12 @@ Expected: `3 passed`
 git add services/query-gateway/app/metadata.py services/query-gateway/tests/test_metadata.py
 git commit -m "feat(stage0): 表清单与表结构元数据工具"
 ```
+
+> **Task 5 对抗式复审裁定（2026-10-23 回写，初审 47d96a1 Approved）**：
+> - **I-1（修复）**：测试 fixture 负责 engine.dispose()（与 executor M6 同类 Windows tmp_path 隐患）。
+> - **M-4（修复）**：公共函数补 `except GatewayError: raise` + `except Exception` 窄兜底（只回显异常类名、不回显内部细节），覆盖无默认库 MySQL 方言抛 AttributeError 等非 SQLAlchemyError 裸逃。
+> - **测试加固**：标识符注入黑名单回归（白名单 gate 拒绝且表不丢）、坏引擎错误包装、非 SQLAlchemyError 结构化、未知表建议含「共 N 张」、所有行含 comment 键。
+> - **接受为 backlog（阶段 1）**：M-1 反射 N+1（一次 list_tables 在 MySQL 上 K+1 次往返，考虑 information_schema 单查/短 TTL 缓存）；M-2 表名大小写逐字匹配（Windows MySQL lower_case_table_names 可能误拒，安全方向）；M-3 连接错误回显 host:port 等内部信息（阶段 1 细分 OperationalError 文案）；M-5 注释降级静默（待日志框架补 warning）；M-6 `str(ENUM)` 丢枚举值；M-7 表名含 `%` 的 PyMySQL 上游 quirk。
 
 ---
 
@@ -1332,7 +1380,7 @@ class Gateway:
 pytest
 ```
 
-Expected: 全部通过 62 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 3 + gateway 5）。
+Expected: 全部通过 65 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 6 + gateway 5）。
 
 - [ ] **Step 5: 提交**
 
