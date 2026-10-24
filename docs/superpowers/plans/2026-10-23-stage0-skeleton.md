@@ -1027,9 +1027,16 @@ def get_table_meta(engine: Engine, table_name: str) -> dict:
 def _table_comment(inspector, table_name: str):
     try:
         return inspector.get_table_comment(table_name).get("text")
-    except SQLAlchemyError:
+    except (SQLAlchemyError, NotImplementedError):
+        # SQLite 方言不实现 get_table_comment（基类直接抛内置 NotImplementedError，
+        # 非 SQLAlchemyError 子类，已在 SQLAlchemy 2.0.55 实测）；注释查不到降级为 None
         return None
 ```
+
+> 勘误（2026-10-23，Task 5 实施时实证）：计划初版 helper 只捕获 SQLAlchemyError，
+> 在 SQLite 上 NotImplementedError 会裸传导致 list_tables/get_table_meta 全挂。
+> MySQL/PG 方言支持表注释反射；降级逻辑精确收敛在 helper 内，公共函数的
+> GatewayError 透传不变量不受影响。
 
 - [ ] **Step 4: 运行确认通过**
 
