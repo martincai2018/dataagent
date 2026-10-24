@@ -29,3 +29,25 @@ def test_caller_cannot_override_timestamp(tmp_path):
     record = json.loads(log_file.read_text(encoding="utf-8").strip())
     assert record["ts"] != "FAKE"
     assert record["event"] == "x"
+
+
+def test_concurrent_appends_do_not_interleave(tmp_path):
+    import threading
+
+    log_file = tmp_path / "audit.jsonl"
+    threads_n, per_thread = 8, 50
+
+    def worker(tid):
+        for i in range(per_thread):
+            append_audit(str(log_file), {"event": "x", "tid": tid, "i": i})
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(threads_n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == threads_n * per_thread  # 无交错、无丢行
+    for line in lines:
+        json.loads(line)  # 每行都是完整合法 JSON
