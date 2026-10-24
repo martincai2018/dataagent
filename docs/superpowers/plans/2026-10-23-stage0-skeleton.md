@@ -979,6 +979,7 @@ def test_identifier_injection_is_blocked_by_gate(engine):
     with pytest.raises(GatewayError) as exc:
         get_table_meta(engine, "x'; DROP TABLE orders --")
     assert exc.value.stage == "metadata"
+    assert "不存在" in exc.value.reason  # 钉死走的是 gate，而非方言引号层的 NoSuchTableError
     assert inspect(engine).has_table("orders")  # 表安然无恙
 
 
@@ -988,18 +989,34 @@ def test_broken_engine_raises_structured_metadata_error(tmp_path):
         with pytest.raises(GatewayError) as exc:
             list_tables(bad_engine)
         assert exc.value.stage == "metadata"
+        assert exc.value.reason.startswith("读取表清单失败：")  # 锁定 SQLAlchemyError 分支
     finally:
         bad_engine.dispose()
 
 
-def test_non_sqlalchemy_error_is_structured(monkeypatch, engine):
-    # 非 SQLAlchemyError（实证：无默认库时 MySQL 方言会抛 AttributeError）也不得裸逃
+def _call_list_tables(mod, eng):
+    return mod.list_tables(eng)
+
+
+def _call_get_table_meta(mod, eng):
+    return mod.get_table_meta(eng, "orders")
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(_call_list_tables, id="list_tables"),
+    pytest.param(_call_get_table_meta, id="get_table_meta"),
+])
+def test_non_sqlalchemy_error_is_structured(monkeypatch, engine, call):
+    # 非 SQLAlchemyError（实证：无默认库时 MySQL 方言会抛 AttributeError）也不得裸逃；
+    # 两个公共函数各自的 except Exception 分支都要覆盖
+    import app.metadata as metadata_module
+
     def _boom(*args, **kwargs):
         raise RuntimeError("unexpected reflection failure")
 
     monkeypatch.setattr("app.metadata.inspect", _boom)
     with pytest.raises(GatewayError) as exc:
-        list_tables(engine)
+        call(metadata_module, engine)
     assert exc.value.stage == "metadata"
 ```
 
@@ -1086,7 +1103,7 @@ def _table_comment(inspector, table_name: str):
 pytest tests/test_metadata.py
 ```
 
-Expected: `6 passed`
+Expected: `7 passed`（6 个测试函数，其中窄兜底参数化为 2 例）
 
 - [ ] **Step 5: 提交**
 
@@ -1381,7 +1398,7 @@ class Gateway:
 pytest
 ```
 
-Expected: 全部通过 65 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 6 + gateway 5）。
+Expected: 全部通过 66 passed（smoke 1 + audit 4 + validator 38 + executor 11 + metadata 7 + gateway 5）。
 
 - [ ] **Step 5: 提交**
 
