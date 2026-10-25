@@ -4,3 +4,6 @@ __pycache__/
 logs/
 *.db
 .pytest_cache/
+
+# 部署密钥（compose 自动读取 deploy/.env，禁止入库）
+deploy/.env

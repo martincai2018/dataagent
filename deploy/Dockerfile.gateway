@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY services/query-gateway/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY services/query-gateway/app /app/app
+COPY services/query-gateway/scripts /app/scripts
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+CMD ["python", "-m", "app.server"]

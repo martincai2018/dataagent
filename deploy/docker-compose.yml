@@ -1,0 +1,73 @@
+name: dataagent-stage0
+
+services:
+  demo-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: demo
+      MYSQL_USER: reader
+      MYSQL_PASSWORD: readerpw
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - ./seed/init_demo.sql:/docker-entrypoint-initdb.d/init_demo.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      start_period: 40s
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [agentnet]
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    environment:
+      DB_URL: mysql+pymysql://reader:readerpw@demo-db/demo
+      SQL_DIALECT: mysql
+      MAX_ROWS: "200"
+      AUDIT_LOG: /logs/audit.jsonl
+      HOST: "0.0.0.0"   # 容器内绑全部网卡；不对宿主机发布端口，仅 agentnet 可达
+      PORT: "8000"
+    volumes:
+      - gateway-logs:/logs
+    # 不做 ports: 发布——网关是 DB-GPT 的内部工具出口，宿主/局域网不应直连
+    depends_on:
+      demo-db:
+        condition: service_healthy
+    healthcheck:
+      # /sse 立即响应 SSE 响应头后保持流打开；urlopen 拿到 200 头即返回退出
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/sse', timeout=3).status==200 else 1)"]
+      start_period: 60s
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks: [agentnet]
+    restart: unless-stopped
+
+  dbgpt:
+    image: eosphorosai/dbgpt-openai:v0.8.2
+    command: dbgpt start webserver --config /app/configs/dbgpt-stage0.toml
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DBGPT_LANG: zh
+    volumes:
+      - ./configs:/app/configs
+      - dbgpt-data:/app/pilot/data
+      - dbgpt-meta:/app/pilot/meta_data
+    ports:
+      - "5670:5670"
+    depends_on: [gateway]
+    networks: [agentnet]
+    restart: unless-stopped
+
+volumes:
+  gateway-logs:
+  dbgpt-data:
+  dbgpt-meta:
+
+networks:
+  agentnet:
+    driver: "bridge"
