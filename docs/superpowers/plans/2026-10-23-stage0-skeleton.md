@@ -2055,6 +2055,26 @@ git commit -m "chore(stage0): demo 交易库种子数据"
 - Create: `deploy/Dockerfile.gateway`
 - Create: `deploy/configs/dbgpt-stage0.toml`
 - Create: `deploy/docker-compose.yml`
+- Create: `deploy/seed/00_readonly_grant.sql`（只读收权）
+
+- [ ] **Step 0: 只读账号收权脚本（Task 10 对抗复审裁定）**
+
+MySQL 官方镜像对 `MYSQL_USER` 自动授予 `MYSQL_DATABASE` 上的 ALL PRIVILEGES，与架构红线
+「只读 DB 账号是 parser 之外的第二道防线」冲突。在 initdb.d 挂一个按文件名字典序最先
+执行的收权脚本（reader 也因此不会拥有全局 FILE 权限，压住 LOAD_FILE backlog P1）：
+
+`deploy/seed/00_readonly_grant.sql`：
+
+```sql
+-- 官方镜像先建 reader 并授 demo.* ALL；这里收权为纯只读，由 /docker-entrypoint-initdb.d
+-- 按文件名字典序执行（00_ 在 init_demo.sql 之前；GRANT ON db.* 不要求表已存在）
+REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'reader'@'%';
+GRANT SELECT ON demo.* TO 'reader'@'%';
+FLUSH PRIVILEGES;
+```
+
+起栈后必须实测：用 reader 账号执行 `CREATE TABLE t(x INT)` 应被拒（ACCESS DENIED），
+`SELECT` 正常；该实测列入 Task 10 Step 6 / Task 11 验收。
 
 - [ ] **Step 1: 网关 Dockerfile**
 
@@ -2130,6 +2150,9 @@ services:
     command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     volumes:
       - ./seed/init_demo.sql:/docker-entrypoint-initdb.d/init_demo.sql:ro
+      # Task 10 对抗复审：官方镜像默认给 MYSQL_USER 授该库 ALL，必须收权为只读，
+      # 否则 parser 之外没有第二道防线（reader 也因此无全局 FILE 权限）
+      - ./seed/00_readonly_grant.sql:/docker-entrypoint-initdb.d/00_readonly_grant.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
       start_period: 40s
